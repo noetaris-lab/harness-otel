@@ -8,6 +8,9 @@ importers:
 
   .:
     devDependencies:
+      '@noetaris/harness':
+        specifier: link:../core
+        version: link:../core
       '@opentelemetry/api':
         specifier: ^1.9.1
         version: 1.9.1
