@@ -1,2 +1,1 @@
-// @noetaris/harness-otel — stub; implementation in F23
-export {}
+export { createOtelObserver, type OtelObserverOptions } from './observer/otel-observer.js'
