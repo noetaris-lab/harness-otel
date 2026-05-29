@@ -4,7 +4,6 @@ import {
   type Tracer,
   type MeterProvider,
   type Meter,
-  type Counter,
   type Histogram,
   SpanStatusCode,
   SpanKind,
@@ -35,22 +34,27 @@ function makeStubTracer(spans: Span[]): Tracer {
   return { startSpan } as unknown as Tracer // as: partial stub — only startSpan is needed
 }
 
-function makeStubMeterProvider(): {
-  meterProvider: MeterProvider
-  meter: Meter
-  counter: Counter
-  histogram: Histogram
-} {
-  const counter = { add: vi.fn() } as unknown as Counter // as: partial stub — only add is needed
-  const histogram = { record: vi.fn() } as unknown as Histogram // as: partial stub — only record is needed
-  const meter = {
-    createCounter: vi.fn().mockReturnValue(counter),
-    createHistogram: vi.fn().mockReturnValue(histogram),
-  } as unknown as Meter // as: partial stub — only createCounter/createHistogram are needed
-  const meterProvider = {
+function makeStubMeterWithHistograms(
+  tokenHistogram: Histogram,
+  durationHistogram: Histogram,
+): Meter {
+  const createHistogram = vi.fn().mockImplementation((name: string) => {
+    if (name === 'gen_ai.client.token.usage') return tokenHistogram
+    if (name === 'gen_ai.client.operation.duration') return durationHistogram
+    return { record: vi.fn() }
+  })
+  return { createHistogram } as unknown as Meter // as: partial stub
+}
+
+function makeStubMeterProvider(tokenHistogram: Histogram, durationHistogram: Histogram): MeterProvider {
+  const meter = makeStubMeterWithHistograms(tokenHistogram, durationHistogram)
+  return {
     getMeter: vi.fn().mockReturnValue(meter),
   } as unknown as MeterProvider // as: partial stub — only getMeter is needed
-  return { meterProvider, meter, counter, histogram }
+}
+
+function makeHistogramStub(): Histogram {
+  return { record: vi.fn() } as unknown as Histogram // as: partial stub — only record is needed
 }
 
 // ---- Tests ----
@@ -63,83 +67,73 @@ describe('createOtelObserver', () => {
   // ---- Group 1: Root span creation (onRunStart) ----
 
   describe('onRunStart', () => {
-    it('starts "agent.run" span with built-in attributes using context.active() when no options given', () => {
-      const stubRootSpan = makeStubSpan()
-      const stubTracer = makeStubTracer([stubRootSpan])
-      const ACTIVE_CTX = {} as ReturnType<typeof context.active> // as: sentinel object used to verify pass-through identity
-      vi.spyOn(context, 'active').mockReturnValue(ACTIVE_CTX)
+    it('creates "invoke_agent {agentId}" span with semconv attributes using context.active() when no options', () => {
+      // arrange
+      const mockRootSpan = makeStubSpan()
+      const mockTracer = makeStubTracer([mockRootSpan])
+      const activeCtx = {} as ReturnType<typeof context.active> // as: sentinel object for identity check
+      vi.spyOn(context, 'active').mockReturnValue(activeCtx)
+      const observer = createOtelObserver(mockTracer)
+      const ctx = { agentId: 'agent-abc', sessionId: 'sess-xyz', runId: 'run-1' }
 
-      const observer = createOtelObserver(stubTracer)
-      const runCtx = { agentId: 'agent-1', sessionId: 'session-abc', runId: 'run-1' }
+      // act
+      observer.onRunStart!(ctx)
 
-      observer.onRunStart!(runCtx)
-
-      expect(stubTracer.startSpan).toHaveBeenCalledWith(
-        'agent.run',
-        { attributes: { 'agent.id': 'agent-1', 'session.id': 'session-abc' } },
-        ACTIVE_CTX,
+      // assert
+      expect(mockTracer.startSpan).toHaveBeenCalledWith(
+        'invoke_agent agent-abc',
+        { attributes: { 'gen_ai.agent.id': 'agent-abc', 'gen_ai.conversation.id': 'sess-xyz', 'gen_ai.operation.name': 'invoke_agent' } },
+        activeCtx,
       )
-      expect(stubTracer.startSpan).toHaveBeenCalledOnce()
     })
 
-    it('starts root span using options.parentContext when provided', () => {
-      const stubRootSpan = makeStubSpan()
-      const stubTracer = makeStubTracer([stubRootSpan])
-      const PARENT_CTX = {} as ReturnType<typeof context.active> // as: sentinel object used to verify pass-through identity
+    it('uses options.parentContext as span parent when provided', () => {
+      // arrange
+      const mockRootSpan = makeStubSpan()
+      const mockTracer = makeStubTracer([mockRootSpan])
+      const explicitCtx = {} as ReturnType<typeof context.active> // as: sentinel object for identity check
+      const observer = createOtelObserver(mockTracer, { parentContext: explicitCtx })
+      const ctx = { agentId: 'agent-abc', sessionId: 'sess-xyz', runId: 'run-1' }
 
-      const observer = createOtelObserver(stubTracer, { parentContext: PARENT_CTX })
-      const runCtx = { agentId: 'a', sessionId: 's', runId: 'run-1' }
+      // act
+      observer.onRunStart!(ctx)
 
-      observer.onRunStart!(runCtx)
-
-      expect(stubTracer.startSpan).toHaveBeenCalledWith('agent.run', expect.any(Object), PARENT_CTX)
+      // assert
+      expect(mockTracer.startSpan).toHaveBeenCalledWith('invoke_agent agent-abc', expect.any(Object), explicitCtx)
     })
 
-    it('merges options.attributes with built-in attributes', () => {
-      const stubRootSpan = makeStubSpan()
-      const stubTracer = makeStubTracer([stubRootSpan])
+    it('merges options.attributes with built-in semconv attributes on root span', () => {
+      // arrange
+      const mockRootSpan = makeStubSpan()
+      const mockTracer = makeStubTracer([mockRootSpan])
+      const observer = createOtelObserver(mockTracer, { attributes: { 'service.version': '1.2.3' } })
+      const ctx = { agentId: 'agent-abc', sessionId: 'sess-xyz', runId: 'run-1' }
 
-      const observer = createOtelObserver(stubTracer, {
-        attributes: { 'service.version': '1.2.3', 'env': 'prod' },
-      })
-      const runCtx = { agentId: 'a1', sessionId: 's1', runId: 'run-1' }
+      // act
+      observer.onRunStart!(ctx)
 
-      observer.onRunStart!(runCtx)
-
-      expect(stubTracer.startSpan).toHaveBeenCalledWith(
-        'agent.run',
-        {
-          attributes: {
-            'service.version': '1.2.3',
-            'env': 'prod',
-            'agent.id': 'a1',
-            'session.id': 's1',
-          },
-        },
+      // assert
+      expect(mockTracer.startSpan).toHaveBeenCalledWith(
+        'invoke_agent agent-abc',
+        { attributes: expect.objectContaining({ 'service.version': '1.2.3', 'gen_ai.agent.id': 'agent-abc', 'gen_ai.conversation.id': 'sess-xyz', 'gen_ai.operation.name': 'invoke_agent' }) },
         expect.anything(),
       )
     })
 
     it('built-in attributes take precedence over conflicting options.attributes', () => {
-      const stubRootSpan = makeStubSpan()
-      const stubTracer = makeStubTracer([stubRootSpan])
+      // arrange
+      const mockRootSpan = makeStubSpan()
+      const mockTracer = makeStubTracer([mockRootSpan])
+      const observer = createOtelObserver(mockTracer, { attributes: { 'gen_ai.agent.id': 'OVERRIDDEN', 'gen_ai.operation.name': 'OVERRIDDEN' } })
+      const ctx = { agentId: 'agent-abc', sessionId: 'sess-xyz', runId: 'run-1' }
 
-      const observer = createOtelObserver(stubTracer, {
-        attributes: { 'agent.id': 'OVERRIDE-ME', 'session.id': 'OVERRIDE-ME-TOO', 'extra': 'x' },
-      })
-      const runCtx = { agentId: 'real-agent', sessionId: 'real-session', runId: 'run-1' }
+      // act
+      observer.onRunStart!(ctx)
 
-      observer.onRunStart!(runCtx)
-
-      expect(stubTracer.startSpan).toHaveBeenCalledWith(
-        'agent.run',
-        {
-          attributes: {
-            'agent.id': 'real-agent',
-            'session.id': 'real-session',
-            'extra': 'x',
-          },
-        },
+      // assert
+      expect(mockTracer.startSpan).toHaveBeenCalledWith(
+        'invoke_agent agent-abc',
+        { attributes: expect.objectContaining({ 'gen_ai.agent.id': 'agent-abc', 'gen_ai.operation.name': 'invoke_agent' }) },
         expect.anything(),
       )
     })
@@ -148,1058 +142,752 @@ describe('createOtelObserver', () => {
   // ---- Group 2: Step span creation (onStepStart) ----
 
   describe('onStepStart', () => {
-    it('creates "agent.step" child span with step.name attribute when root span is active', () => {
-      const stubRootSpan = makeStubSpan()
-      const stubStepSpan = makeStubSpan()
-      const stubTracer = makeStubTracer([stubRootSpan, stubStepSpan])
-      const CHILD_CTX = {} as ReturnType<typeof context.active> // as: sentinel object used to verify pass-through identity
-      vi.spyOn(trace, 'setSpan').mockReturnValue(CHILD_CTX)
+    it('creates "harness.step {stepName}" span with gen_ai.step.name attribute as child of root span', () => {
+      // arrange
+      const mockRootSpan = makeStubSpan()
+      const mockStepSpan = makeStubSpan()
+      const mockTracer = makeStubTracer([mockRootSpan, mockStepSpan])
+      const stepParentCtx = {} as ReturnType<typeof context.active> // as: sentinel object for identity check
+      vi.spyOn(trace, 'setSpan').mockReturnValue(stepParentCtx)
+      const observer = createOtelObserver(mockTracer)
+      observer.onRunStart!({ agentId: 'a', sessionId: 's', runId: 'r' })
 
-      const observer = createOtelObserver(stubTracer)
-      observer.onRunStart!({ agentId: 'a', sessionId: 's', runId: 'run-1' })
+      // act
+      observer.onStepStart!({ agentId: 'a', sessionId: 's', stepName: 'plan' })
 
-      const stepCtx = { agentId: 'a', sessionId: 's', runId: 'run-1', stepName: 'my-step' }
-
-      observer.onStepStart!(stepCtx)
-
-      expect(trace.setSpan).toHaveBeenCalledWith(expect.anything(), stubRootSpan)
-      expect(stubTracer.startSpan).toHaveBeenNthCalledWith(
-        2,
-        'agent.step',
-        { attributes: { 'step.name': 'my-step' } },
-        CHILD_CTX,
+      // assert
+      expect(mockTracer.startSpan).toHaveBeenCalledWith(
+        'harness.step plan',
+        { attributes: { 'gen_ai.step.name': 'plan' } },
+        stepParentCtx,
       )
-    })
-
-    it('does not create a step span when no root span is active', () => {
-      const stubTracer = makeStubTracer([])
-
-      const observer = createOtelObserver(stubTracer)
-      const stepCtx = { agentId: 'a', sessionId: 's', runId: 'run-1', stepName: 'step-x' }
-
-      observer.onStepStart!(stepCtx)
-
-      expect(stubTracer.startSpan).not.toHaveBeenCalled()
-    })
-  })
-
-  // ---- Group 3: Step span termination (onStepEnd and onStepError) ----
-
-  describe('onStepEnd', () => {
-    it('ends step span and clears closure reference when step span is active', () => {
-      const stubRootSpan = makeStubSpan()
-      const stubStepSpan = makeStubSpan()
-      const stubTracer = makeStubTracer([stubRootSpan, stubStepSpan])
-
-      const observer = createOtelObserver(stubTracer)
-      observer.onRunStart!({ agentId: 'a', sessionId: 's', runId: 'run-1' })
-      observer.onStepStart!({ agentId: 'a', sessionId: 's', stepName: 'fetch' })
-
-      const stepCtx = { agentId: 'a', sessionId: 's', runId: 'run-1', stepName: 'fetch' }
-
-      observer.onStepEnd!(stepCtx, { durationMs: 120 })
-
-      expect(stubStepSpan.end).toHaveBeenCalledOnce()
-
-      observer.onStepEnd!(stepCtx, { durationMs: 0 })
-
-      expect(stubStepSpan.end).toHaveBeenCalledOnce()
-    })
-
-    it('is a no-op when no step span is active', () => {
-      const stubRootSpan = makeStubSpan()
-      const stubTracer = makeStubTracer([stubRootSpan])
-
-      const observer = createOtelObserver(stubTracer)
-      observer.onRunStart!({ agentId: 'a', sessionId: 's', runId: 'run-1' })
-
-      const stepCtx = { agentId: 'a', sessionId: 's', runId: 'run-1', stepName: 'x' }
-
-      observer.onStepEnd!(stepCtx, { durationMs: 50 })
-
-      expect(stubRootSpan.end).not.toHaveBeenCalled()
-    })
-  })
-
-  describe('onStepError', () => {
-    it('sets ERROR status, ends step span, and clears reference when step span is active', () => {
-      const stubRootSpan = makeStubSpan()
-      const stubStepSpan = makeStubSpan()
-      const stubTracer = makeStubTracer([stubRootSpan, stubStepSpan])
-
-      const observer = createOtelObserver(stubTracer)
-      observer.onRunStart!({ agentId: 'a', sessionId: 's', runId: 'run-1' })
-      observer.onStepStart!({ agentId: 'a', sessionId: 's', stepName: 'risky' })
-
-      const testError = new Error('something broke')
-      const stepCtx = { agentId: 'a', sessionId: 's', runId: 'run-1', stepName: 'risky' }
-
-      observer.onStepError!(stepCtx, { error: testError, durationMs: 75 })
-
-      expect(stubStepSpan.setStatus).toHaveBeenCalledWith({
-        code: SpanStatusCode.ERROR,
-        message: 'Error: something broke',
-      })
-      expect(stubStepSpan.end).toHaveBeenCalledOnce()
-
-      observer.onStepError!(stepCtx, { error: testError, durationMs: 0 })
-
-      expect(stubStepSpan.end).toHaveBeenCalledOnce()
-    })
-
-    it('is a no-op when no step span is active', () => {
-      const stubRootSpan = makeStubSpan()
-      const stubTracer = makeStubTracer([stubRootSpan])
-
-      const observer = createOtelObserver(stubTracer)
-      observer.onRunStart!({ agentId: 'a', sessionId: 's', runId: 'run-1' })
-
-      const stepCtx = { agentId: 'a', sessionId: 's', runId: 'run-1', stepName: 'x' }
-
-      observer.onStepError!(stepCtx, { error: new Error('e'), durationMs: 10 })
-
-      expect(stubRootSpan.end).not.toHaveBeenCalled()
-    })
-  })
-
-  // ---- Group 4: Root span termination (onRunEnd) ----
-
-  describe('onRunEnd', () => {
-    it('ends root span and clears closure reference when root span is active', () => {
-      const stubRootSpan = makeStubSpan()
-      const stubTracer = makeStubTracer([stubRootSpan])
-
-      const observer = createOtelObserver(stubTracer)
-      observer.onRunStart!({ agentId: 'a', sessionId: 's', runId: 'run-1' })
-
-      const runCtx = { agentId: 'a', sessionId: 's', runId: 'run-1' }
-
-      observer.onRunEnd!(runCtx, { signal: 'done', durationMs: 500 })
-
-      expect(stubRootSpan.end).toHaveBeenCalledOnce()
-
-      observer.onRunEnd!(runCtx, { signal: 'done', durationMs: 0 })
-
-      expect(stubRootSpan.end).toHaveBeenCalledOnce()
     })
 
     it('is a no-op when no root span is active', () => {
-      const stubTracer = makeStubTracer([])
+      // arrange
+      const mockTracer = makeStubTracer([])
 
-      const observer = createOtelObserver(stubTracer)
-      const runCtx = { agentId: 'a', sessionId: 's', runId: 'run-1' }
+      // act
+      const observer = createOtelObserver(mockTracer)
+      observer.onStepStart!({ agentId: 'a', sessionId: 's', stepName: 'plan' })
 
-      observer.onRunEnd!(runCtx, { signal: 'done', durationMs: 0 })
-
-      expect(stubTracer.startSpan).not.toHaveBeenCalled()
+      // assert
+      expect(mockTracer.startSpan).not.toHaveBeenCalled()
     })
   })
 
-  // ---- Group 5: Observer reuse and double-start behavior ----
+  // ---- Group 3: Step lifecycle (onStepEnd and onStepError) ----
 
-  describe('observer reuse', () => {
+  describe('onStepEnd', () => {
+    it('ends the active step span', () => {
+      // arrange
+      const mockRootSpan = makeStubSpan()
+      const mockStepSpan = makeStubSpan()
+      const mockTracer = makeStubTracer([mockRootSpan, mockStepSpan])
+      const observer = createOtelObserver(mockTracer)
+      observer.onRunStart!({ agentId: 'a', sessionId: 's', runId: 'r' })
+      observer.onStepStart!({ agentId: 'a', sessionId: 's', stepName: 'plan' })
+
+      // act
+      observer.onStepEnd!({ agentId: 'a', sessionId: 's', stepName: 'plan' }, { durationMs: 500 })
+
+      // assert
+      expect(mockStepSpan.end).toHaveBeenCalledOnce()
+    })
+
+    it('does not record any duration metric at step scope', () => {
+      // arrange
+      const mockDurationHistogram = makeHistogramStub()
+      const mockTokenHistogram = makeHistogramStub()
+      const mockMeterProvider = makeStubMeterProvider(mockTokenHistogram, mockDurationHistogram)
+      const mockRootSpan = makeStubSpan()
+      const mockStepSpan = makeStubSpan()
+      const mockTracer = makeStubTracer([mockRootSpan, mockStepSpan])
+      const observer = createOtelObserver(mockTracer, { meterProvider: mockMeterProvider })
+      observer.onRunStart!({ agentId: 'a', sessionId: 's', runId: 'r' })
+      observer.onStepStart!({ agentId: 'a', sessionId: 's', stepName: 'plan' })
+
+      // act
+      observer.onStepEnd!({ agentId: 'a', sessionId: 's', stepName: 'plan' }, { durationMs: 500 })
+
+      // assert
+      expect(mockDurationHistogram.record).not.toHaveBeenCalled()
+    })
+
+    it('clears step span reference so subsequent call is a true no-op', () => {
+      // arrange
+      const mockRootSpan = makeStubSpan()
+      const mockStepSpan = makeStubSpan()
+      const mockTracer = makeStubTracer([mockRootSpan, mockStepSpan])
+      const observer = createOtelObserver(mockTracer)
+      observer.onRunStart!({ agentId: 'a', sessionId: 's', runId: 'r' })
+      observer.onStepStart!({ agentId: 'a', sessionId: 's', stepName: 'plan' })
+      observer.onStepEnd!({ agentId: 'a', sessionId: 's', stepName: 'plan' }, { durationMs: 100 })
+
+      // act
+      observer.onStepEnd!({ agentId: 'a', sessionId: 's', stepName: 'plan' }, { durationMs: 100 })
+
+      // assert
+      expect(mockStepSpan.end).toHaveBeenCalledOnce()
+    })
+
+    it('is a no-op when no step span was ever started', () => {
+      // arrange
+      const mockRootSpan = makeStubSpan()
+      const mockTracer = makeStubTracer([mockRootSpan])
+      const observer = createOtelObserver(mockTracer)
+      observer.onRunStart!({ agentId: 'a', sessionId: 's', runId: 'r' })
+
+      // act / assert
+      expect(() => observer.onStepEnd!({ agentId: 'a', sessionId: 's', stepName: 'plan' }, { durationMs: 0 })).not.toThrow()
+    })
+
+    it('sets ERROR status and ends step span on onStepError', () => {
+      // arrange
+      const mockRootSpan = makeStubSpan()
+      const mockStepSpan = makeStubSpan()
+      const mockTracer = makeStubTracer([mockRootSpan, mockStepSpan])
+      const observer = createOtelObserver(mockTracer)
+      observer.onRunStart!({ agentId: 'a', sessionId: 's', runId: 'r' })
+      observer.onStepStart!({ agentId: 'a', sessionId: 's', stepName: 'plan' })
+      const err = new Error('step blew up')
+
+      // act
+      observer.onStepError!({ agentId: 'a', sessionId: 's', stepName: 'plan' }, { error: err, durationMs: 100 })
+
+      // assert
+      expect(mockStepSpan.setStatus).toHaveBeenCalledWith({ code: SpanStatusCode.ERROR, message: 'Error: step blew up' })
+      expect(mockStepSpan.end).toHaveBeenCalledOnce()
+    })
+
+    it('onStepError is a no-op when no step span is active', () => {
+      // arrange
+      const mockRootSpan = makeStubSpan()
+      const mockTracer = makeStubTracer([mockRootSpan])
+      const observer = createOtelObserver(mockTracer)
+      observer.onRunStart!({ agentId: 'a', sessionId: 's', runId: 'r' })
+
+      // act / assert
+      expect(() => observer.onStepError!({ agentId: 'a', sessionId: 's', stepName: 'plan' }, { error: new Error('x'), durationMs: 0 })).not.toThrow()
+    })
+  })
+
+  // ---- Group 4: Closure reference clearing across repeated calls ----
+
+  describe('closure reference clearing', () => {
     it('second onRunStart without intervening onRunEnd overwrites root span reference', () => {
-      const stubRootSpan1 = makeStubSpan()
-      const stubRootSpan2 = makeStubSpan()
-      const stubTracer = makeStubTracer([stubRootSpan1, stubRootSpan2])
+      // arrange
+      const mockRootSpan1 = makeStubSpan()
+      const mockRootSpan2 = makeStubSpan()
+      const mockTracer = makeStubTracer([mockRootSpan1, mockRootSpan2])
+      const observer = createOtelObserver(mockTracer)
+      const ctx1 = { agentId: 'a1', sessionId: 's1', runId: 'r1' }
+      const ctx2 = { agentId: 'a2', sessionId: 's2', runId: 'r2' }
 
-      const observer = createOtelObserver(stubTracer)
-      observer.onRunStart!({ agentId: 'a', sessionId: 's', runId: 'run-1' })
+      // act
+      observer.onRunStart!(ctx1)
+      observer.onRunStart!(ctx2)
 
-      observer.onRunStart!({ agentId: 'b', sessionId: 't', runId: 'run-2' })
-
-      expect(stubRootSpan1.end).not.toHaveBeenCalled()
-
-      observer.onRunEnd!({ agentId: 'b', sessionId: 't', runId: 'run-2' }, { signal: 'done', durationMs: 0 })
-
-      expect(stubRootSpan2.end).toHaveBeenCalledOnce()
+      // assert
+      expect(mockTracer.startSpan).toHaveBeenCalledTimes(2)
+      expect(mockRootSpan1.end).not.toHaveBeenCalled()
+      observer.onRunEnd!(ctx2, { signal: 'done', durationMs: 0 })
+      expect(mockRootSpan2.end).toHaveBeenCalledOnce()
     })
 
-    it('is safely reusable across sequential runs', () => {
-      const stubRootSpan1 = makeStubSpan()
-      const stubRootSpan2 = makeStubSpan()
-      const stubTracer = makeStubTracer([stubRootSpan1, stubRootSpan2])
+    it('Observer is safely reusable across sequential runs', () => {
+      // arrange
+      const mockRootSpan1 = makeStubSpan()
+      const mockRootSpan2 = makeStubSpan()
+      const mockTracer = makeStubTracer([mockRootSpan1, mockRootSpan2])
+      const observer = createOtelObserver(mockTracer)
+      const ctx = { agentId: 'a', sessionId: 's', runId: 'r' }
 
-      const observer = createOtelObserver(stubTracer)
-      observer.onRunStart!({ agentId: 'a', sessionId: 's', runId: 'run-1' })
-      observer.onRunEnd!({ agentId: 'a', sessionId: 's', runId: 'run-1' }, { signal: 'done', durationMs: 0 })
+      // act
+      observer.onRunStart!(ctx)
+      observer.onRunEnd!(ctx, { signal: 'done', durationMs: 100 })
+      observer.onRunStart!(ctx)
 
-      observer.onRunStart!({ agentId: 'c', sessionId: 'u', runId: 'run-3' })
-
-      expect(stubTracer.startSpan).toHaveBeenCalledTimes(2)
-
-      observer.onRunEnd!({ agentId: 'c', sessionId: 'u', runId: 'run-3' }, { signal: 'done', durationMs: 0 })
-
-      expect(stubRootSpan2.end).toHaveBeenCalledOnce()
-    })
-  })
-
-  // ---- Group 6: Token counter metrics (onEvent with "llm.response") ----
-
-  describe('onEvent — llm.response', () => {
-    it('records input and output token counter adds for valid "llm.response" payload', () => {
-      const { meterProvider, counter } = makeStubMeterProvider()
-      const stubRootSpan = makeStubSpan()
-      const stubTracer = makeStubTracer([stubRootSpan])
-
-      const observer = createOtelObserver(stubTracer, { meterProvider })
-      observer.onRunStart!({ agentId: 'a', sessionId: 's', runId: 'run-1' })
-
-      const payload = { tokens: { input: 300, output: 150 } }
-
-      observer.onEvent!({ agentId: 'a', sessionId: 's', stepName: 'llm' }, 'llm.response', payload)
-
-      expect(counter.add).toHaveBeenCalledTimes(2)
-      expect(counter.add).toHaveBeenCalledWith(300, { 'token.type': 'input' })
-      expect(counter.add).toHaveBeenCalledWith(150, { 'token.type': 'output' })
-    })
-
-    it('does not call counter when meterProvider was not provided', () => {
-      const stubRootSpan = makeStubSpan()
-      const stubTracer = makeStubTracer([stubRootSpan])
-
-      const observer = createOtelObserver(stubTracer)
-      observer.onRunStart!({ agentId: 'a', sessionId: 's', runId: 'run-1' })
-
-      const payload = { tokens: { input: 100, output: 50 } }
-
-      expect(() => {
-        observer.onEvent!({ agentId: 'a', sessionId: 's', stepName: 'llm' }, 'llm.response', payload)
-      }).not.toThrow()
-    })
-
-    it('skips counter.add when tokens field is missing or malformed', () => {
-      const { meterProvider, counter } = makeStubMeterProvider()
-      const stubRootSpan = makeStubSpan()
-      const stubTracer = makeStubTracer([stubRootSpan])
-
-      const observer = createOtelObserver(stubTracer, { meterProvider })
-      observer.onRunStart!({ agentId: 'a', sessionId: 's', runId: 'run-1' })
-
-      const evtCtx = { agentId: 'a', sessionId: 's', stepName: 'llm' }
-
-      observer.onEvent!(evtCtx, 'llm.response', {})
-      observer.onEvent!(evtCtx, 'llm.response', { tokens: null })
-      observer.onEvent!(evtCtx, 'llm.response', { tokens: { input: 'not-a-number', output: 50 } })
-
-      expect(counter.add).not.toHaveBeenCalled()
-    })
-
-    it('"llm.response" events do not call span.addEvent on any active span', () => {
-      const stubRootSpan = makeStubSpan()
-      const stubStepSpan = makeStubSpan()
-      const stubTracer = makeStubTracer([stubRootSpan, stubStepSpan])
-      const { meterProvider } = makeStubMeterProvider()
-
-      const observer = createOtelObserver(stubTracer, { meterProvider })
-      observer.onRunStart!({ agentId: 'a', sessionId: 's', runId: 'run-1' })
-      observer.onStepStart!({ agentId: 'a', sessionId: 's', stepName: 'llm-step' })
-
-      const payload = { tokens: { input: 10, output: 5 } }
-
-      observer.onEvent!({ agentId: 'a', sessionId: 's', stepName: 'llm-step' }, 'llm.response', payload)
-
-      expect(stubStepSpan.addEvent).not.toHaveBeenCalled()
-      expect(stubRootSpan.addEvent).not.toHaveBeenCalled()
+      // assert
+      expect(mockTracer.startSpan).toHaveBeenCalledTimes(2)
+      expect(mockRootSpan1.end).toHaveBeenCalledOnce()
+      expect(mockRootSpan2.end).not.toHaveBeenCalled()
     })
   })
 
-  // ---- Group 7: Step duration histogram metrics ----
+  // ---- Group 5: Run lifecycle (onRunEnd and duration histogram) ----
 
-  describe('histogram — onStepEnd and onStepError', () => {
-    it('onStepEnd records step duration to histogram when meterProvider is provided', () => {
-      const { meterProvider, histogram } = makeStubMeterProvider()
-      const stubRootSpan = makeStubSpan()
-      const stubStepSpan = makeStubSpan()
-      const stubTracer = makeStubTracer([stubRootSpan, stubStepSpan])
+  describe('onRunEnd', () => {
+    it('ends root span and records duration histogram in seconds with semconv attribute', () => {
+      // arrange
+      const mockRootSpan = makeStubSpan()
+      const mockDurationHistogram = makeHistogramStub()
+      const mockTokenHistogram = makeHistogramStub()
+      const mockMeterProvider = makeStubMeterProvider(mockTokenHistogram, mockDurationHistogram)
+      const mockTracer = makeStubTracer([mockRootSpan])
+      const observer = createOtelObserver(mockTracer, { meterProvider: mockMeterProvider })
+      observer.onRunStart!({ agentId: 'a', sessionId: 's', runId: 'r' })
 
-      const observer = createOtelObserver(stubTracer, { meterProvider })
-      observer.onRunStart!({ agentId: 'a', sessionId: 's', runId: 'run-1' })
-      observer.onStepStart!({ agentId: 'a', sessionId: 's', stepName: 'embed' })
+      // act
+      observer.onRunEnd!({ agentId: 'a', sessionId: 's', runId: 'r' }, { signal: 'done', durationMs: 3000 })
 
-      const stepCtx = { agentId: 'a', sessionId: 's', runId: 'run-1', stepName: 'embed' }
-
-      observer.onStepEnd!(stepCtx, { durationMs: 250 })
-
-      expect(histogram.record).toHaveBeenCalledWith(250, { 'step.name': 'embed' })
-      expect(stubStepSpan.end).toHaveBeenCalledOnce()
+      // assert
+      expect(mockRootSpan.end).toHaveBeenCalledOnce()
+      expect(mockDurationHistogram.record).toHaveBeenCalledWith(3, { 'gen_ai.operation.name': 'invoke_agent' })
     })
 
-    it('onStepEnd does not record histogram and still ends span when meterProvider absent', () => {
-      const stubRootSpan = makeStubSpan()
-      const stubStepSpan = makeStubSpan()
-      const stubTracer = makeStubTracer([stubRootSpan, stubStepSpan])
+    it('is a no-op when no root span is active — no span end, no histogram recording', () => {
+      // arrange
+      const mockDurationHistogram = makeHistogramStub()
+      const mockTokenHistogram = makeHistogramStub()
+      const mockMeterProvider = makeStubMeterProvider(mockTokenHistogram, mockDurationHistogram)
+      const mockTracer = makeStubTracer([])
+      const observer = createOtelObserver(mockTracer, { meterProvider: mockMeterProvider })
 
-      const observer = createOtelObserver(stubTracer)
-      observer.onRunStart!({ agentId: 'a', sessionId: 's', runId: 'run-1' })
-      observer.onStepStart!({ agentId: 'a', sessionId: 's', stepName: 'search' })
-
-      const stepCtx = { agentId: 'a', sessionId: 's', runId: 'run-1', stepName: 'search' }
-
-      observer.onStepEnd!(stepCtx, { durationMs: 80 })
-
-      expect(stubStepSpan.end).toHaveBeenCalledOnce()
+      // act / assert
+      expect(() => observer.onRunEnd!({ agentId: 'a', sessionId: 's', runId: 'r' }, { signal: 'done', durationMs: 1000 })).not.toThrow()
+      expect(mockDurationHistogram.record).not.toHaveBeenCalled()
     })
 
-    it('onStepError records step duration to histogram when meterProvider is provided', () => {
-      const { meterProvider, histogram } = makeStubMeterProvider()
-      const stubRootSpan = makeStubSpan()
-      const stubStepSpan = makeStubSpan()
-      const stubTracer = makeStubTracer([stubRootSpan, stubStepSpan])
+    it('ends root span but records no histogram when no meterProvider', () => {
+      // arrange
+      const mockRootSpan = makeStubSpan()
+      const mockTracer = makeStubTracer([mockRootSpan])
+      const observer = createOtelObserver(mockTracer)
+      observer.onRunStart!({ agentId: 'a', sessionId: 's', runId: 'r' })
 
-      const observer = createOtelObserver(stubTracer, { meterProvider })
-      observer.onRunStart!({ agentId: 'a', sessionId: 's', runId: 'run-1' })
-      observer.onStepStart!({ agentId: 'a', sessionId: 's', stepName: 'parse' })
-
-      const stepCtx = { agentId: 'a', sessionId: 's', runId: 'run-1', stepName: 'parse' }
-      const testError = new Error('fail')
-
-      observer.onStepError!(stepCtx, { error: testError, durationMs: 33 })
-
-      expect(histogram.record).toHaveBeenCalledWith(33, { 'step.name': 'parse' })
-      expect(stubStepSpan.end).toHaveBeenCalledOnce()
-    })
-
-    it('onStepError does not record histogram and still sets status and ends span when meterProvider absent', () => {
-      const stubRootSpan = makeStubSpan()
-      const stubStepSpan = makeStubSpan()
-      const stubTracer = makeStubTracer([stubRootSpan, stubStepSpan])
-
-      const observer = createOtelObserver(stubTracer)
-      observer.onRunStart!({ agentId: 'a', sessionId: 's', runId: 'run-1' })
-      observer.onStepStart!({ agentId: 'a', sessionId: 's', stepName: 'validate' })
-
-      const stepCtx = { agentId: 'a', sessionId: 's', runId: 'run-1', stepName: 'validate' }
-      const testError = new Error('boom')
-
-      observer.onStepError!(stepCtx, { error: testError, durationMs: 15 })
-
-      expect(stubStepSpan.setStatus).toHaveBeenCalledOnce()
-      expect(stubStepSpan.end).toHaveBeenCalledOnce()
+      // act / assert
+      observer.onRunEnd!({ agentId: 'a', sessionId: 's', runId: 'r' }, { signal: 'done', durationMs: 2000 })
+      expect(mockRootSpan.end).toHaveBeenCalledOnce()
     })
   })
 
-  // ---- Group 8: onEvent non-"llm.response" routing ----
+  // ---- Group 6: Token histogram instrument (gen_ai.client.token.usage) ----
 
-  describe('onEvent — non-llm.response', () => {
-    it('calls stepSpan.addEvent(type) when step span is active', () => {
-      const stubRootSpan = makeStubSpan()
-      const stubStepSpan = makeStubSpan()
-      const stubTracer = makeStubTracer([stubRootSpan, stubStepSpan])
+  describe('onEvent — token histogram', () => {
+    it('records input and output token counts to histogram with gen_ai.token.type attribute', () => {
+      // arrange
+      const mockTokenHistogram = makeHistogramStub()
+      const mockDurationHistogram = makeHistogramStub()
+      const mockMeterProvider = makeStubMeterProvider(mockTokenHistogram, mockDurationHistogram)
+      const mockRootSpan = makeStubSpan()
+      const mockInferenceSpan = makeStubSpan()
+      const mockTracer = makeStubTracer([mockRootSpan, mockInferenceSpan])
+      const observer = createOtelObserver(mockTracer, { meterProvider: mockMeterProvider })
+      observer.onRunStart!({ agentId: 'a', sessionId: 's', runId: 'r' })
+      const payload = { modelId: 'gpt-4o', providerName: 'openai', tokens: { input: 42, output: 17 } }
 
-      const observer = createOtelObserver(stubTracer)
-      observer.onRunStart!({ agentId: 'a', sessionId: 's', runId: 'run-1' })
-      observer.onStepStart!({ agentId: 'a', sessionId: 's', stepName: 'tool-call' })
+      // act
+      observer.onEvent!({ agentId: 'a', sessionId: 's', stepName: 's' }, 'llm.response', payload)
 
-      const evtCtx = { agentId: 'a', sessionId: 's', stepName: 'tool-call' }
+      // assert
+      expect(mockTokenHistogram.record).toHaveBeenCalledWith(42, { 'gen_ai.token.type': 'input' })
+      expect(mockTokenHistogram.record).toHaveBeenCalledWith(17, { 'gen_ai.token.type': 'output' })
+      expect(mockTokenHistogram.record).toHaveBeenCalledTimes(2)
+    })
 
-      observer.onEvent!(evtCtx, 'step.progress', { data: 'something' })
+    it('does not record any metrics when meterProvider is absent and "llm.response" fires', () => {
+      // arrange
+      const mockRootSpan = makeStubSpan()
+      const mockInferenceSpan = makeStubSpan()
+      const mockTracer = makeStubTracer([mockRootSpan, mockInferenceSpan])
+      const observer = createOtelObserver(mockTracer)
+      observer.onRunStart!({ agentId: 'a', sessionId: 's', runId: 'r' })
+      const payload = { modelId: 'gpt-4o', providerName: 'openai', tokens: { input: 10, output: 5 } }
 
-      expect(stubStepSpan.addEvent).toHaveBeenCalledWith('step.progress')
-      expect(stubRootSpan.addEvent).not.toHaveBeenCalled()
+      // act / assert
+      expect(() => observer.onEvent!({ agentId: 'a', sessionId: 's', stepName: 's' }, 'llm.response', payload)).not.toThrow()
+    })
+
+    it('does not record histogram when tokens fields are missing — no tokens field', () => {
+      // arrange
+      const mockTokenHistogram = makeHistogramStub()
+      const mockDurationHistogram = makeHistogramStub()
+      const mockMeterProvider = makeStubMeterProvider(mockTokenHistogram, mockDurationHistogram)
+      const mockRootSpan = makeStubSpan()
+      const mockInferenceSpan = makeStubSpan()
+      const mockTracer = makeStubTracer([mockRootSpan, mockInferenceSpan])
+      const observer = createOtelObserver(mockTracer, { meterProvider: mockMeterProvider })
+      observer.onRunStart!({ agentId: 'a', sessionId: 's', runId: 'r' })
+
+      // act
+      observer.onEvent!({ agentId: 'a', sessionId: 's', stepName: 's' }, 'llm.response', { modelId: 'gpt-4o', providerName: 'openai' })
+
+      // assert
+      expect(mockTokenHistogram.record).not.toHaveBeenCalled()
+    })
+
+    it('does not record histogram when tokens.input is non-numeric', () => {
+      // arrange
+      const mockTokenHistogram = makeHistogramStub()
+      const mockDurationHistogram = makeHistogramStub()
+      const mockMeterProvider = makeStubMeterProvider(mockTokenHistogram, mockDurationHistogram)
+      const mockRootSpan = makeStubSpan()
+      const mockInferenceSpan = makeStubSpan()
+      const mockTracer = makeStubTracer([mockRootSpan, mockInferenceSpan])
+      const observer = createOtelObserver(mockTracer, { meterProvider: mockMeterProvider })
+      observer.onRunStart!({ agentId: 'a', sessionId: 's', runId: 'r' })
+
+      // act
+      observer.onEvent!({ agentId: 'a', sessionId: 's', stepName: 's' }, 'llm.response', { modelId: 'gpt-4o', providerName: 'openai', tokens: { input: 'bad', output: 5 } })
+
+      // assert
+      expect(mockTokenHistogram.record).not.toHaveBeenCalled()
+    })
+
+    it('does not record histogram when tokens.output is missing', () => {
+      // arrange
+      const mockTokenHistogram = makeHistogramStub()
+      const mockDurationHistogram = makeHistogramStub()
+      const mockMeterProvider = makeStubMeterProvider(mockTokenHistogram, mockDurationHistogram)
+      const mockRootSpan = makeStubSpan()
+      const mockInferenceSpan = makeStubSpan()
+      const mockTracer = makeStubTracer([mockRootSpan, mockInferenceSpan])
+      const observer = createOtelObserver(mockTracer, { meterProvider: mockMeterProvider })
+      observer.onRunStart!({ agentId: 'a', sessionId: 's', runId: 'r' })
+
+      // act
+      observer.onEvent!({ agentId: 'a', sessionId: 's', stepName: 's' }, 'llm.response', { modelId: 'gpt-4o', providerName: 'openai', tokens: { input: 10 } })
+
+      // assert
+      expect(mockTokenHistogram.record).not.toHaveBeenCalled()
+    })
+  })
+
+  // ---- Group 7: Tool spans (tool.call and tool.result) ----
+
+  describe('onEvent — tool spans', () => {
+    it('"tool.call" creates "execute_tool {toolName}" INTERNAL span with semconv attributes as child of step span', () => {
+      // arrange
+      const mockRootSpan = makeStubSpan()
+      const mockStepSpan = makeStubSpan()
+      const mockToolSpan = makeStubSpan()
+      const mockTracer = makeStubTracer([mockRootSpan, mockStepSpan, mockToolSpan])
+      const toolParentCtx = {} as ReturnType<typeof context.active> // as: sentinel object for identity check
+      vi.spyOn(trace, 'setSpan').mockReturnValue(toolParentCtx)
+      const observer = createOtelObserver(mockTracer)
+      observer.onRunStart!({ agentId: 'a', sessionId: 's', runId: 'r' })
+      observer.onStepStart!({ agentId: 'a', sessionId: 's', stepName: 'plan' })
+
+      // act
+      observer.onEvent!({ agentId: 'a', sessionId: 's', stepName: 's' }, 'tool.call', { toolName: 'search', toolCallId: 'tc-1' })
+
+      // assert
+      expect(mockTracer.startSpan).toHaveBeenCalledWith(
+        'execute_tool search',
+        { kind: SpanKind.INTERNAL, attributes: { 'gen_ai.tool.name': 'search', 'gen_ai.operation.name': 'execute_tool' } },
+        toolParentCtx,
+      )
+      expect(mockToolSpan.end).not.toHaveBeenCalled()
+    })
+
+    it('"tool.call" creates span as child of root span when no step span is active', () => {
+      // arrange
+      const mockRootSpan = makeStubSpan()
+      const mockToolSpan = makeStubSpan()
+      const mockTracer = makeStubTracer([mockRootSpan, mockToolSpan])
+      const rootParentCtx = {} as ReturnType<typeof context.active> // as: sentinel object for identity check
+      vi.spyOn(trace, 'setSpan').mockReturnValue(rootParentCtx)
+      const observer = createOtelObserver(mockTracer)
+      observer.onRunStart!({ agentId: 'a', sessionId: 's', runId: 'r' })
+
+      // act
+      observer.onEvent!({ agentId: 'a', sessionId: 's', stepName: 's' }, 'tool.call', { toolName: 'fetch', toolCallId: 'tc-2' })
+
+      // assert
+      expect(mockTracer.startSpan).toHaveBeenCalledWith(
+        'execute_tool fetch',
+        expect.objectContaining({ attributes: { 'gen_ai.tool.name': 'fetch', 'gen_ai.operation.name': 'execute_tool' } }),
+        rootParentCtx,
+      )
+    })
+
+    it('"tool.result" ends tool span without error status when no error in payload', () => {
+      // arrange
+      const mockRootSpan = makeStubSpan()
+      const mockStepSpan = makeStubSpan()
+      const mockToolSpan = makeStubSpan()
+      const mockTracer = makeStubTracer([mockRootSpan, mockStepSpan, mockToolSpan])
+      const observer = createOtelObserver(mockTracer)
+      observer.onRunStart!({ agentId: 'a', sessionId: 's', runId: 'r' })
+      observer.onStepStart!({ agentId: 'a', sessionId: 's', stepName: 'plan' })
+      observer.onEvent!({ agentId: 'a', sessionId: 's', stepName: 's' }, 'tool.call', { toolName: 'search', toolCallId: 'tc-1' })
+
+      // act
+      observer.onEvent!({ agentId: 'a', sessionId: 's', stepName: 's' }, 'tool.result', { toolCallId: 'tc-1' })
+
+      // assert
+      expect(mockToolSpan.end).toHaveBeenCalledOnce()
+      expect(mockToolSpan.setStatus).not.toHaveBeenCalled()
+      observer.onEvent!({ agentId: 'a', sessionId: 's', stepName: 's' }, 'tool.result', { toolCallId: 'tc-1' })
+      expect(mockToolSpan.end).toHaveBeenCalledOnce()
+    })
+
+    it('"tool.result" sets error status and ends tool span when error is set', () => {
+      // arrange
+      const mockRootSpan = makeStubSpan()
+      const mockStepSpan = makeStubSpan()
+      const mockToolSpan = makeStubSpan()
+      const mockTracer = makeStubTracer([mockRootSpan, mockStepSpan, mockToolSpan])
+      const observer = createOtelObserver(mockTracer)
+      observer.onRunStart!({ agentId: 'a', sessionId: 's', runId: 'r' })
+      observer.onStepStart!({ agentId: 'a', sessionId: 's', stepName: 'plan' })
+      observer.onEvent!({ agentId: 'a', sessionId: 's', stepName: 's' }, 'tool.call', { toolName: 'search', toolCallId: 'tc-1' })
+      const toolErr = new Error('tool failed')
+
+      // act
+      observer.onEvent!({ agentId: 'a', sessionId: 's', stepName: 's' }, 'tool.result', { toolCallId: 'tc-1', error: toolErr })
+
+      // assert
+      expect(mockToolSpan.setStatus).toHaveBeenCalledWith({ code: SpanStatusCode.ERROR, message: 'Error: tool failed' })
+      expect(mockToolSpan.end).toHaveBeenCalledOnce()
+    })
+
+    it('"tool.call" is a no-op when neither root nor step span is active', () => {
+      // arrange
+      const mockTracer = makeStubTracer([])
+      const observer = createOtelObserver(mockTracer)
+
+      // act / assert
+      expect(() => observer.onEvent!({ agentId: 'a', sessionId: 's', stepName: 's' }, 'tool.call', { toolName: 'x', toolCallId: 'tc-1' })).not.toThrow()
+      expect(mockTracer.startSpan).not.toHaveBeenCalled()
+    })
+
+    it('"tool.result" for unknown toolCallId is a no-op', () => {
+      // arrange
+      const mockRootSpan = makeStubSpan()
+      const mockStepSpan = makeStubSpan()
+      const mockToolSpan = makeStubSpan()
+      const mockTracer = makeStubTracer([mockRootSpan, mockStepSpan, mockToolSpan])
+      const observer = createOtelObserver(mockTracer)
+      observer.onRunStart!({ agentId: 'a', sessionId: 's', runId: 'r' })
+      observer.onStepStart!({ agentId: 'a', sessionId: 's', stepName: 'plan' })
+      observer.onEvent!({ agentId: 'a', sessionId: 's', stepName: 's' }, 'tool.call', { toolName: 'search', toolCallId: 'tc-1' })
+
+      // act / assert
+      expect(() => observer.onEvent!({ agentId: 'a', sessionId: 's', stepName: 's' }, 'tool.result', { toolCallId: 'tc-UNKNOWN' })).not.toThrow()
+    })
+
+    it('second "tool.call" for same toolCallId overwrites old span — subsequent "tool.result" closes new span', () => {
+      // arrange
+      const mockRootSpan = makeStubSpan()
+      const mockStepSpan = makeStubSpan()
+      const mockToolSpan1 = makeStubSpan()
+      const mockToolSpan2 = makeStubSpan()
+      const mockTracer = makeStubTracer([mockRootSpan, mockStepSpan, mockToolSpan1, mockToolSpan2])
+      const observer = createOtelObserver(mockTracer)
+      observer.onRunStart!({ agentId: 'a', sessionId: 's', runId: 'r' })
+      observer.onStepStart!({ agentId: 'a', sessionId: 's', stepName: 'plan' })
+      observer.onEvent!({ agentId: 'a', sessionId: 's', stepName: 's' }, 'tool.call', { toolName: 'search', toolCallId: 'tc-dup' })
+
+      // act
+      observer.onEvent!({ agentId: 'a', sessionId: 's', stepName: 's' }, 'tool.call', { toolName: 'search', toolCallId: 'tc-dup' })
+      observer.onEvent!({ agentId: 'a', sessionId: 's', stepName: 's' }, 'tool.result', { toolCallId: 'tc-dup' })
+
+      // assert
+      expect(mockToolSpan2.end).toHaveBeenCalledOnce()
+      expect(mockToolSpan1.end).not.toHaveBeenCalled()
+    })
+  })
+
+  // ---- Group 8: Non-reserved event fallback (span.addEvent) ----
+
+  describe('onEvent — non-reserved event fallback', () => {
+    it('calls stepSpan.addEvent(type) when step span is active — payload not forwarded', () => {
+      // arrange
+      const mockRootSpan = makeStubSpan()
+      const mockStepSpan = makeStubSpan()
+      const mockTracer = makeStubTracer([mockRootSpan, mockStepSpan])
+      const observer = createOtelObserver(mockTracer)
+      observer.onRunStart!({ agentId: 'a', sessionId: 's', runId: 'r' })
+      observer.onStepStart!({ agentId: 'a', sessionId: 's', stepName: 'plan' })
+
+      // act
+      observer.onEvent!({ agentId: 'a', sessionId: 's', stepName: 's' }, 'custom.event', { foo: 'bar' })
+
+      // assert
+      expect(mockStepSpan.addEvent).toHaveBeenCalledWith('custom.event')
+      expect(mockRootSpan.addEvent).not.toHaveBeenCalled()
     })
 
     it('calls rootSpan.addEvent(type) when only root span is active', () => {
-      const stubRootSpan = makeStubSpan()
-      const stubTracer = makeStubTracer([stubRootSpan])
+      // arrange
+      const mockRootSpan = makeStubSpan()
+      const mockTracer = makeStubTracer([mockRootSpan])
+      const observer = createOtelObserver(mockTracer)
+      observer.onRunStart!({ agentId: 'a', sessionId: 's', runId: 'r' })
 
-      const observer = createOtelObserver(stubTracer)
-      observer.onRunStart!({ agentId: 'a', sessionId: 's', runId: 'run-1' })
+      // act
+      observer.onEvent!({ agentId: 'a', sessionId: 's', stepName: 's' }, 'custom.event', {})
 
-      const evtCtx = { agentId: 'a', sessionId: 's', stepName: 'x' }
-
-      observer.onEvent!(evtCtx, 'custom.event', { x: 1 })
-
-      expect(stubRootSpan.addEvent).toHaveBeenCalledWith('custom.event')
+      // assert
+      expect(mockRootSpan.addEvent).toHaveBeenCalledWith('custom.event')
     })
 
-    it('is a no-op when neither step span nor root span is active', () => {
-      const stubTracer = makeStubTracer([])
+    it('is a no-op when neither span is active', () => {
+      // arrange
+      const mockTracer = makeStubTracer([])
+      const observer = createOtelObserver(mockTracer)
 
-      const observer = createOtelObserver(stubTracer)
-      const evtCtx = { agentId: 'a', sessionId: 's', stepName: 'x' }
-
-      expect(() => {
-        observer.onEvent!(evtCtx, 'some.event', {})
-      }).not.toThrow()
-
-      expect(stubTracer.startSpan).not.toHaveBeenCalled()
+      // act / assert
+      expect(() => observer.onEvent!({ agentId: 'a', sessionId: 's', stepName: 's' }, 'custom.event', {})).not.toThrow()
     })
   })
 
-  // ---- Group 9: Factory isolation and defaults ----
+  // ---- Group 9: Factory construction and closure isolation ----
 
-  describe('factory isolation and defaults', () => {
-    it('two Observer instances maintain independent closure state', () => {
-      const stubRootSpan1 = makeStubSpan()
-      const stubRootSpan2 = makeStubSpan()
-      const stubTracer = makeStubTracer([stubRootSpan1, stubRootSpan2])
+  describe('factory construction and closure isolation', () => {
+    it('two Observer instances from same factory have independent closure state', () => {
+      // arrange
+      const mockSpan1 = makeStubSpan()
+      const mockSpan2 = makeStubSpan()
+      const mockTracer = makeStubTracer([mockSpan1, mockSpan2])
+      const observerA = createOtelObserver(mockTracer)
+      const observerB = createOtelObserver(mockTracer)
+      const ctxA = { agentId: 'a', sessionId: 's1', runId: 'r1' }
+      const ctxB = { agentId: 'b', sessionId: 's2', runId: 'r2' }
 
-      const observer1 = createOtelObserver(stubTracer)
-      const observer2 = createOtelObserver(stubTracer)
+      // act
+      observerA.onRunStart!(ctxA)
+      observerB.onRunStart!(ctxB)
+      observerA.onRunEnd!(ctxA, { signal: 'done', durationMs: 0 })
 
-      observer1.onRunStart!({ agentId: 'a1', sessionId: 's1', runId: 'run-1' })
-      observer2.onRunStart!({ agentId: 'a2', sessionId: 's2', runId: 'run-2' })
-
-      observer1.onRunEnd!({ agentId: 'a1', sessionId: 's1', runId: 'run-1' }, { signal: 'done', durationMs: 0 })
-
-      expect(stubRootSpan1.end).toHaveBeenCalledOnce()
-      expect(stubRootSpan2.end).not.toHaveBeenCalled()
+      // assert
+      expect(mockSpan1.end).toHaveBeenCalledOnce()
+      expect(mockSpan2.end).not.toHaveBeenCalled()
     })
 
-    it('no options — no metrics recorded and spans use context.active() as parent', () => {
-      const stubRootSpan = makeStubSpan()
-      const stubTracer = makeStubTracer([stubRootSpan])
-      const ACTIVE_CTX = {} as ReturnType<typeof context.active> // as: sentinel object used to verify pass-through identity
-      vi.spyOn(context, 'active').mockReturnValue(ACTIVE_CTX)
+    it('Observer with no options uses context.active() and records no metrics', () => {
+      // arrange
+      const mockRootSpan = makeStubSpan()
+      const mockTracer = makeStubTracer([mockRootSpan])
+      const activeCtx = {} as ReturnType<typeof context.active> // as: sentinel object for identity check
+      vi.spyOn(context, 'active').mockReturnValue(activeCtx)
+      const observer = createOtelObserver(mockTracer)
+      const ctx = { agentId: 'a', sessionId: 's', runId: 'r' }
 
-      const observer = createOtelObserver(stubTracer)
-      const runCtx = { agentId: 'x', sessionId: 'y', runId: 'run-1' }
+      // act
+      observer.onRunStart!(ctx)
+      observer.onRunEnd!(ctx, { signal: 'done', durationMs: 100 })
 
-      observer.onRunStart!(runCtx)
-
-      expect(stubTracer.startSpan).toHaveBeenCalledWith('agent.run', expect.any(Object), ACTIVE_CTX)
-
-      expect(() => {
-        observer.onEvent!(
-          { agentId: 'x', sessionId: 'y', stepName: 'llm' },
-          'llm.response',
-          { tokens: { input: 1, output: 1 } },
-        )
-      }).not.toThrow()
+      // assert
+      expect(mockTracer.startSpan).toHaveBeenCalledWith('invoke_agent a', expect.any(Object), activeCtx)
+      expect(mockRootSpan.end).toHaveBeenCalledOnce()
     })
 
-    it('instruments are created exactly once regardless of how many onEvent calls are made', () => {
-      const { meterProvider, meter, counter } = makeStubMeterProvider()
-      const stubRootSpan = makeStubSpan()
-      const stubTracer = makeStubTracer([stubRootSpan])
+    it('getMeter and both histograms are created once at factory time, not per-run', () => {
+      // arrange
+      const mockTokenHistogram = makeHistogramStub()
+      const mockDurationHistogram = makeHistogramStub()
+      const mockMeter = makeStubMeterWithHistograms(mockTokenHistogram, mockDurationHistogram)
+      const mockMeterProvider = {
+        getMeter: vi.fn().mockReturnValue(mockMeter),
+      } as unknown as MeterProvider // as: partial stub
+      const mockTracer = makeStubTracer(Array.from({ length: 10 }, () => makeStubSpan()))
+      const ctx = { agentId: 'a', sessionId: 's', runId: 'r' }
 
-      const observer = createOtelObserver(stubTracer, { meterProvider })
-      observer.onRunStart!({ agentId: 'a', sessionId: 's', runId: 'run-1' })
+      // act
+      const observer = createOtelObserver(mockTracer, { meterProvider: mockMeterProvider })
+      observer.onRunStart!(ctx)
+      observer.onRunEnd!(ctx, { signal: 'done', durationMs: 500 })
+      observer.onRunStart!(ctx)
+      observer.onRunEnd!(ctx, { signal: 'done', durationMs: 500 })
 
-      const payload = { tokens: { input: 10, output: 5 } }
-      const evtCtx = { agentId: 'a', sessionId: 's', stepName: 'llm' }
-
-      observer.onEvent!(evtCtx, 'llm.response', payload)
-      observer.onEvent!(evtCtx, 'llm.response', payload)
-      observer.onEvent!(evtCtx, 'llm.response', payload)
-
-      expect(meterProvider.getMeter).toHaveBeenCalledOnce()
-      expect(meter.createCounter).toHaveBeenCalledOnce()
-      expect(meter.createHistogram).toHaveBeenCalledOnce()
-      expect(counter.add).toHaveBeenCalledTimes(6)
-    })
-  })
-
-  // ---- Group 1: "tool.call" span creation — valid payload ----
-
-  describe('onEvent — tool.call (valid payload)', () => {
-    it('starts "execute_tool {toolName}" INTERNAL span as child of step span', () => {
-      const stubRootSpan = makeStubSpan()
-      const stubStepSpan = makeStubSpan()
-      const stubToolSpan = makeStubSpan()
-      const stubTracer = makeStubTracer([stubRootSpan, stubStepSpan, stubToolSpan])
-      const STEP_CHILD_CTX = {} as ReturnType<typeof context.active> // as: sentinel object used to verify pass-through identity
-      vi.spyOn(trace, 'setSpan').mockReturnValue(STEP_CHILD_CTX)
-
-      const observer = createOtelObserver(stubTracer)
-      observer.onRunStart!({ agentId: 'a', sessionId: 's', runId: 'run-1' })
-      observer.onStepStart!({ agentId: 'a', sessionId: 's', stepName: 'my-step' })
-
-      observer.onEvent!({ agentId: 'a', sessionId: 's', stepName: 'my-step' }, 'tool.call', {
-        toolName: 'search',
-        toolCallId: 'call-1',
-      })
-
-      expect(trace.setSpan).toHaveBeenCalledWith(expect.anything(), stubStepSpan)
-      expect(stubTracer.startSpan).toHaveBeenNthCalledWith(
-        3,
-        'execute_tool search',
-        { kind: SpanKind.INTERNAL, attributes: { 'gen_ai.tool.name': 'search', 'gen_ai.operation.name': 'execute_tool' } },
-        STEP_CHILD_CTX,
-      )
-    })
-
-    it('span stored in toolSpans under toolCallId and closed by matching "tool.result"', () => {
-      const stubRootSpan = makeStubSpan()
-      const stubStepSpan = makeStubSpan()
-      const stubToolSpan = makeStubSpan()
-      const stubTracer = makeStubTracer([stubRootSpan, stubStepSpan, stubToolSpan])
-
-      const observer = createOtelObserver(stubTracer)
-      observer.onRunStart!({ agentId: 'a', sessionId: 's', runId: 'run-1' })
-      observer.onStepStart!({ agentId: 'a', sessionId: 's', stepName: 's' })
-
-      observer.onEvent!({ agentId: 'a', sessionId: 's', stepName: 's' }, 'tool.call', {
-        toolName: 'search',
-        toolCallId: 'call-1',
-      })
-      observer.onEvent!({ agentId: 'a', sessionId: 's', stepName: 's' }, 'tool.result', {
-        toolName: 'search',
-        toolCallId: 'call-1',
-        durationMs: 10,
-      })
-
-      expect(stubToolSpan.end).toHaveBeenCalledOnce()
-      expect(stubRootSpan.end).not.toHaveBeenCalled()
-      expect(stubStepSpan.end).not.toHaveBeenCalled()
+      // assert
+      expect(mockMeterProvider.getMeter).toHaveBeenCalledOnce()
+      expect(mockMeter.createHistogram).toHaveBeenCalledTimes(2)
+      expect(mockMeter.createHistogram).toHaveBeenCalledWith('gen_ai.client.token.usage', { unit: '{token}' })
+      expect(mockMeter.createHistogram).toHaveBeenCalledWith('gen_ai.client.operation.duration', { unit: 's' })
     })
   })
 
-  // ---- Group 2: "tool.call" guard — malformed payload fields ----
+  // ---- Group 10: Inference span from "llm.response" events ----
 
-  describe('onEvent — tool.call (guards)', () => {
-    it('ignores "tool.call" when toolName is not a string', () => {
-      const stubRootSpan = makeStubSpan()
-      const stubStepSpan = makeStubSpan()
-      const stubTracer = makeStubTracer([stubRootSpan, stubStepSpan])
+  describe('onEvent — inference span', () => {
+    it('creates "chat {modelId}" INTERNAL span as child of step span; sets all attributes; ends immediately', () => {
+      // arrange
+      const mockRootSpan = makeStubSpan()
+      const mockStepSpan = makeStubSpan()
+      const mockInferenceSpan = makeStubSpan()
+      const mockTracer = makeStubTracer([mockRootSpan, mockStepSpan, mockInferenceSpan])
+      const inferenceParentCtx = {} as ReturnType<typeof context.active> // as: sentinel object for identity check
+      vi.spyOn(trace, 'setSpan').mockReturnValue(inferenceParentCtx)
+      const observer = createOtelObserver(mockTracer)
+      observer.onRunStart!({ agentId: 'a', sessionId: 's', runId: 'r' })
+      observer.onStepStart!({ agentId: 'a', sessionId: 's', stepName: 'plan' })
+      const payload = { modelId: 'gpt-4o', providerName: 'openai', tokens: { input: 10, output: 5 }, stopReason: 'stop' }
 
-      const observer = createOtelObserver(stubTracer)
-      observer.onRunStart!({ agentId: 'a', sessionId: 's', runId: 'run-1' })
-      observer.onStepStart!({ agentId: 'a', sessionId: 's', stepName: 's' })
+      // act
+      observer.onEvent!({ agentId: 'a', sessionId: 's', stepName: 's' }, 'llm.response', payload)
 
-      observer.onEvent!({ agentId: 'a', sessionId: 's', stepName: 's' }, 'tool.call', {
-        toolName: 42,
-        toolCallId: 'call-1',
-      })
-
-      expect(stubTracer.startSpan).toHaveBeenCalledTimes(2)
+      // assert
+      expect(mockTracer.startSpan).toHaveBeenCalledWith('chat gpt-4o', { kind: SpanKind.INTERNAL }, inferenceParentCtx)
+      expect(mockInferenceSpan.setAttribute).toHaveBeenCalledWith('gen_ai.request.model', 'gpt-4o')
+      expect(mockInferenceSpan.setAttribute).toHaveBeenCalledWith('gen_ai.provider.name', 'openai')
+      expect(mockInferenceSpan.setAttribute).toHaveBeenCalledWith('gen_ai.usage.input_tokens', 10)
+      expect(mockInferenceSpan.setAttribute).toHaveBeenCalledWith('gen_ai.usage.output_tokens', 5)
+      expect(mockInferenceSpan.setAttribute).toHaveBeenCalledWith('gen_ai.response.finish_reasons', ['stop'])
+      expect(mockInferenceSpan.end).toHaveBeenCalledOnce()
     })
 
-    it('ignores "tool.call" when toolCallId is not a string', () => {
-      const stubRootSpan = makeStubSpan()
-      const stubStepSpan = makeStubSpan()
-      const stubTracer = makeStubTracer([stubRootSpan, stubStepSpan])
+    it('creates inference span as child of root span when no step span is active', () => {
+      // arrange
+      const mockRootSpan = makeStubSpan()
+      const mockInferenceSpan = makeStubSpan()
+      const mockTracer = makeStubTracer([mockRootSpan, mockInferenceSpan])
+      const rootParentCtx = {} as ReturnType<typeof context.active> // as: sentinel object for identity check
+      vi.spyOn(trace, 'setSpan').mockReturnValue(rootParentCtx)
+      const observer = createOtelObserver(mockTracer)
+      observer.onRunStart!({ agentId: 'a', sessionId: 's', runId: 'r' })
+      const payload = { modelId: 'gpt-4o', providerName: 'openai', tokens: { input: 10, output: 5 } }
 
-      const observer = createOtelObserver(stubTracer)
-      observer.onRunStart!({ agentId: 'a', sessionId: 's', runId: 'run-1' })
-      observer.onStepStart!({ agentId: 'a', sessionId: 's', stepName: 's' })
+      // act
+      observer.onEvent!({ agentId: 'a', sessionId: 's', stepName: 's' }, 'llm.response', payload)
 
-      observer.onEvent!({ agentId: 'a', sessionId: 's', stepName: 's' }, 'tool.call', {
-        toolName: 'search',
-        toolCallId: undefined,
-      })
-
-      expect(stubTracer.startSpan).toHaveBeenCalledTimes(2)
-    })
-  })
-
-  // ---- Group 3: "tool.call" parent span fallback and no-span guard ----
-
-  describe('onEvent — tool.call (parent span fallback)', () => {
-    it('uses root span as parent when step span is not active', () => {
-      const stubRootSpan = makeStubSpan()
-      const stubToolSpan = makeStubSpan()
-      const stubTracer = makeStubTracer([stubRootSpan, stubToolSpan])
-      const ROOT_CHILD_CTX = {} as ReturnType<typeof context.active> // as: sentinel object used to verify pass-through identity
-      vi.spyOn(trace, 'setSpan').mockReturnValue(ROOT_CHILD_CTX)
-
-      const observer = createOtelObserver(stubTracer)
-      observer.onRunStart!({ agentId: 'a', sessionId: 's', runId: 'run-1' })
-
-      observer.onEvent!({ agentId: 'a', sessionId: 's', stepName: 'x' }, 'tool.call', {
-        toolName: 'search',
-        toolCallId: 'call-1',
-      })
-
-      expect(trace.setSpan).toHaveBeenCalledWith(expect.anything(), stubRootSpan)
-      expect(stubTracer.startSpan).toHaveBeenNthCalledWith(
-        2,
-        'execute_tool search',
-        expect.objectContaining({ kind: SpanKind.INTERNAL }),
-        ROOT_CHILD_CTX,
-      )
+      // assert
+      expect(mockTracer.startSpan).toHaveBeenCalledWith('chat gpt-4o', { kind: SpanKind.INTERNAL }, rootParentCtx)
+      expect(mockInferenceSpan.end).toHaveBeenCalledOnce()
     })
 
-    it('is a no-op when neither step span nor root span is active', () => {
-      const stubTracer = makeStubTracer([])
+    it('no inference span created when neither root nor step span is active', () => {
+      // arrange
+      const mockTracer = makeStubTracer([])
+      const observer = createOtelObserver(mockTracer)
+      const payload = { modelId: 'gpt-4o', providerName: 'openai', tokens: { input: 5, output: 5 } }
 
-      const observer = createOtelObserver(stubTracer)
-
-      observer.onEvent!({ agentId: 'a', sessionId: 's', stepName: 'x' }, 'tool.call', {
-        toolName: 'search',
-        toolCallId: 'call-1',
-      })
-
-      expect(stubTracer.startSpan).not.toHaveBeenCalled()
-    })
-  })
-
-  // ---- Group 4: duplicate "tool.call" for same toolCallId ----
-
-  describe('onEvent — tool.call (duplicate toolCallId)', () => {
-    it('second "tool.call" for same toolCallId overwrites map entry; new span is closed by subsequent "tool.result"', () => {
-      const stubRootSpan = makeStubSpan()
-      const stubStepSpan = makeStubSpan()
-      const stubToolSpan1 = makeStubSpan()
-      const stubToolSpan2 = makeStubSpan()
-      const stubTracer = makeStubTracer([stubRootSpan, stubStepSpan, stubToolSpan1, stubToolSpan2])
-
-      const observer = createOtelObserver(stubTracer)
-      observer.onRunStart!({ agentId: 'a', sessionId: 's', runId: 'run-1' })
-      observer.onStepStart!({ agentId: 'a', sessionId: 's', stepName: 's' })
-
-      observer.onEvent!({ agentId: 'a', sessionId: 's', stepName: 's' }, 'tool.call', {
-        toolName: 'search',
-        toolCallId: 'call-1',
-      })
-      observer.onEvent!({ agentId: 'a', sessionId: 's', stepName: 's' }, 'tool.call', {
-        toolName: 'search',
-        toolCallId: 'call-1',
-      })
-      observer.onEvent!({ agentId: 'a', sessionId: 's', stepName: 's' }, 'tool.result', {
-        toolName: 'search',
-        toolCallId: 'call-1',
-        durationMs: 5,
-      })
-
-      expect(stubToolSpan2.end).toHaveBeenCalledOnce()
-      expect(stubToolSpan1.end).not.toHaveBeenCalled()
-    })
-  })
-
-  // ---- Group 5: "tool.result" span close — success path ----
-
-  describe('onEvent — tool.result (success path)', () => {
-    it('ends tool span with no status change when error field is absent', () => {
-      const stubRootSpan = makeStubSpan()
-      const stubStepSpan = makeStubSpan()
-      const stubToolSpan = makeStubSpan()
-      const stubTracer = makeStubTracer([stubRootSpan, stubStepSpan, stubToolSpan])
-
-      const observer = createOtelObserver(stubTracer)
-      observer.onRunStart!({ agentId: 'a', sessionId: 's', runId: 'run-1' })
-      observer.onStepStart!({ agentId: 'a', sessionId: 's', stepName: 's' })
-      observer.onEvent!({ agentId: 'a', sessionId: 's', stepName: 's' }, 'tool.call', {
-        toolName: 'search',
-        toolCallId: 'call-1',
-      })
-
-      observer.onEvent!({ agentId: 'a', sessionId: 's', stepName: 's' }, 'tool.result', {
-        toolName: 'search',
-        toolCallId: 'call-1',
-        durationMs: 42,
-      })
-
-      expect(stubToolSpan.setStatus).not.toHaveBeenCalled()
-      expect(stubToolSpan.end).toHaveBeenCalledOnce()
+      // act / assert
+      expect(() => observer.onEvent!({ agentId: 'a', sessionId: 's', stepName: 's' }, 'llm.response', payload)).not.toThrow()
+      expect(mockTracer.startSpan).not.toHaveBeenCalled()
     })
 
-    it('ends tool span with no error status when error is explicitly undefined', () => {
-      const stubRootSpan = makeStubSpan()
-      const stubStepSpan = makeStubSpan()
-      const stubToolSpan = makeStubSpan()
-      const stubTracer = makeStubTracer([stubRootSpan, stubStepSpan, stubToolSpan])
+    it('no inference span when modelId is not a string; token histogram still records if valid', () => {
+      // arrange
+      const mockTokenHistogram = makeHistogramStub()
+      const mockDurationHistogram = makeHistogramStub()
+      const mockMeterProvider = makeStubMeterProvider(mockTokenHistogram, mockDurationHistogram)
+      const mockRootSpan = makeStubSpan()
+      const mockTracer = makeStubTracer([mockRootSpan])
+      const observer = createOtelObserver(mockTracer, { meterProvider: mockMeterProvider })
+      observer.onRunStart!({ agentId: 'a', sessionId: 's', runId: 'r' })
+      const payload = { modelId: 42, providerName: 'openai', tokens: { input: 10, output: 5 } }
 
-      const observer = createOtelObserver(stubTracer)
-      observer.onRunStart!({ agentId: 'a', sessionId: 's', runId: 'run-1' })
-      observer.onStepStart!({ agentId: 'a', sessionId: 's', stepName: 's' })
-      observer.onEvent!({ agentId: 'a', sessionId: 's', stepName: 's' }, 'tool.call', {
-        toolName: 'search',
-        toolCallId: 'call-1',
-      })
+      // act
+      observer.onEvent!({ agentId: 'a', sessionId: 's', stepName: 's' }, 'llm.response', payload)
 
-      observer.onEvent!({ agentId: 'a', sessionId: 's', stepName: 's' }, 'tool.result', {
-        toolName: 'search',
-        toolCallId: 'call-1',
-        durationMs: 42,
-        error: undefined,
-      })
-
-      expect(stubToolSpan.setStatus).not.toHaveBeenCalled()
-      expect(stubToolSpan.end).toHaveBeenCalledOnce()
+      // assert
+      expect(mockTracer.startSpan).toHaveBeenCalledTimes(1)
+      expect(mockTokenHistogram.record).toHaveBeenCalledWith(10, { 'gen_ai.token.type': 'input' })
+      expect(mockTokenHistogram.record).toHaveBeenCalledWith(5, { 'gen_ai.token.type': 'output' })
     })
 
-    it('map entry is removed after "tool.result" — second result for same toolCallId is a no-op', () => {
-      const stubRootSpan = makeStubSpan()
-      const stubStepSpan = makeStubSpan()
-      const stubToolSpan = makeStubSpan()
-      const stubTracer = makeStubTracer([stubRootSpan, stubStepSpan, stubToolSpan])
+    it('no inference span when providerName is not a string; token histogram still records if valid', () => {
+      // arrange
+      const mockTokenHistogram = makeHistogramStub()
+      const mockDurationHistogram = makeHistogramStub()
+      const mockMeterProvider = makeStubMeterProvider(mockTokenHistogram, mockDurationHistogram)
+      const mockRootSpan = makeStubSpan()
+      const mockTracer = makeStubTracer([mockRootSpan])
+      const observer = createOtelObserver(mockTracer, { meterProvider: mockMeterProvider })
+      observer.onRunStart!({ agentId: 'a', sessionId: 's', runId: 'r' })
+      const payload = { modelId: 'gpt-4o', providerName: null, tokens: { input: 7, output: 3 } }
 
-      const observer = createOtelObserver(stubTracer)
-      observer.onRunStart!({ agentId: 'a', sessionId: 's', runId: 'run-1' })
-      observer.onStepStart!({ agentId: 'a', sessionId: 's', stepName: 's' })
-      observer.onEvent!({ agentId: 'a', sessionId: 's', stepName: 's' }, 'tool.call', {
-        toolName: 'search',
-        toolCallId: 'call-1',
-      })
-      observer.onEvent!({ agentId: 'a', sessionId: 's', stepName: 's' }, 'tool.result', {
-        toolName: 'search',
-        toolCallId: 'call-1',
-        durationMs: 10,
-      })
+      // act
+      observer.onEvent!({ agentId: 'a', sessionId: 's', stepName: 's' }, 'llm.response', payload)
 
-      observer.onEvent!({ agentId: 'a', sessionId: 's', stepName: 's' }, 'tool.result', {
-        toolName: 'search',
-        toolCallId: 'call-1',
-        durationMs: 10,
-      })
+      // assert
+      expect(mockTracer.startSpan).toHaveBeenCalledTimes(1)
+      expect(mockTokenHistogram.record).toHaveBeenCalledWith(7, { 'gen_ai.token.type': 'input' })
+      expect(mockTokenHistogram.record).toHaveBeenCalledWith(3, { 'gen_ai.token.type': 'output' })
+    })
 
-      expect(stubToolSpan.end).toHaveBeenCalledOnce()
+    it('inference span created but token attributes omitted when tokens are absent', () => {
+      // arrange
+      const mockTokenHistogram = makeHistogramStub()
+      const mockDurationHistogram = makeHistogramStub()
+      const mockMeterProvider = makeStubMeterProvider(mockTokenHistogram, mockDurationHistogram)
+      const mockRootSpan = makeStubSpan()
+      const mockInferenceSpan = makeStubSpan()
+      const mockTracer = makeStubTracer([mockRootSpan, mockInferenceSpan])
+      const observer = createOtelObserver(mockTracer, { meterProvider: mockMeterProvider })
+      observer.onRunStart!({ agentId: 'a', sessionId: 's', runId: 'r' })
+      const payload = { modelId: 'gpt-4o', providerName: 'openai', stopReason: 'stop' }
+
+      // act
+      observer.onEvent!({ agentId: 'a', sessionId: 's', stepName: 's' }, 'llm.response', payload)
+
+      // assert
+      expect(mockTracer.startSpan).toHaveBeenCalledTimes(2)
+      expect(mockInferenceSpan.setAttribute).toHaveBeenCalledWith('gen_ai.request.model', 'gpt-4o')
+      expect(mockInferenceSpan.setAttribute).toHaveBeenCalledWith('gen_ai.provider.name', 'openai')
+      expect(mockInferenceSpan.setAttribute).toHaveBeenCalledWith('gen_ai.response.finish_reasons', ['stop'])
+      expect(mockInferenceSpan.setAttribute).not.toHaveBeenCalledWith('gen_ai.usage.input_tokens', expect.anything())
+      expect(mockInferenceSpan.setAttribute).not.toHaveBeenCalledWith('gen_ai.usage.output_tokens', expect.anything())
+      expect(mockTokenHistogram.record).not.toHaveBeenCalled()
+      expect(mockInferenceSpan.end).toHaveBeenCalledOnce()
+    })
+
+    it('inference span created without gen_ai.response.finish_reasons when stopReason is absent', () => {
+      // arrange
+      const mockRootSpan = makeStubSpan()
+      const mockInferenceSpan = makeStubSpan()
+      const mockTracer = makeStubTracer([mockRootSpan, mockInferenceSpan])
+      const observer = createOtelObserver(mockTracer)
+      observer.onRunStart!({ agentId: 'a', sessionId: 's', runId: 'r' })
+      const payload = { modelId: 'gpt-4o', providerName: 'openai', tokens: { input: 5, output: 3 } }
+
+      // act
+      observer.onEvent!({ agentId: 'a', sessionId: 's', stepName: 's' }, 'llm.response', payload)
+
+      // assert
+      expect(mockInferenceSpan.setAttribute).not.toHaveBeenCalledWith('gen_ai.response.finish_reasons', expect.anything())
+      expect(mockInferenceSpan.end).toHaveBeenCalledOnce()
+    })
+
+    it('"llm.response" never calls span.addEvent on any active span', () => {
+      // arrange
+      const mockRootSpan = makeStubSpan()
+      const mockStepSpan = makeStubSpan()
+      const mockInferenceSpan = makeStubSpan()
+      const mockTracer = makeStubTracer([mockRootSpan, mockStepSpan, mockInferenceSpan])
+      const observer = createOtelObserver(mockTracer)
+      observer.onRunStart!({ agentId: 'a', sessionId: 's', runId: 'r' })
+      observer.onStepStart!({ agentId: 'a', sessionId: 's', stepName: 'plan' })
+      const payload = { modelId: 'gpt-4o', providerName: 'openai', tokens: { input: 5, output: 3 } }
+
+      // act
+      observer.onEvent!({ agentId: 'a', sessionId: 's', stepName: 's' }, 'llm.response', payload)
+
+      // assert
+      expect(mockStepSpan.addEvent).not.toHaveBeenCalled()
+      expect(mockRootSpan.addEvent).not.toHaveBeenCalled()
+      expect(mockInferenceSpan.addEvent).not.toHaveBeenCalled()
     })
   })
 
-  // ---- Group 6: "tool.result" span close — error path ----
-
-  describe('onEvent — tool.result (error path)', () => {
-    it('sets SpanStatusCode.ERROR with String(error) message and ends span when error is an Error instance', () => {
-      const stubRootSpan = makeStubSpan()
-      const stubStepSpan = makeStubSpan()
-      const stubToolSpan = makeStubSpan()
-      const stubTracer = makeStubTracer([stubRootSpan, stubStepSpan, stubToolSpan])
-
-      const observer = createOtelObserver(stubTracer)
-      observer.onRunStart!({ agentId: 'a', sessionId: 's', runId: 'run-1' })
-      observer.onStepStart!({ agentId: 'a', sessionId: 's', stepName: 's' })
-      observer.onEvent!({ agentId: 'a', sessionId: 's', stepName: 's' }, 'tool.call', {
-        toolName: 'search',
-        toolCallId: 'call-1',
-      })
-      const testError = new Error('not found')
-
-      observer.onEvent!({ agentId: 'a', sessionId: 's', stepName: 's' }, 'tool.result', {
-        toolName: 'search',
-        toolCallId: 'call-1',
-        durationMs: 5,
-        error: testError,
-      })
-
-      expect(stubToolSpan.setStatus).toHaveBeenCalledWith({
-        code: SpanStatusCode.ERROR,
-        message: 'Error: not found',
-      })
-      expect(stubToolSpan.end).toHaveBeenCalledOnce()
-    })
-
-    it('coerces non-Error error value to string via String() in the status message', () => {
-      const stubRootSpan = makeStubSpan()
-      const stubStepSpan = makeStubSpan()
-      const stubToolSpan = makeStubSpan()
-      const stubTracer = makeStubTracer([stubRootSpan, stubStepSpan, stubToolSpan])
-
-      const observer = createOtelObserver(stubTracer)
-      observer.onRunStart!({ agentId: 'a', sessionId: 's', runId: 'run-1' })
-      observer.onStepStart!({ agentId: 'a', sessionId: 's', stepName: 's' })
-      observer.onEvent!({ agentId: 'a', sessionId: 's', stepName: 's' }, 'tool.call', {
-        toolName: 'search',
-        toolCallId: 'call-1',
-      })
-
-      observer.onEvent!({ agentId: 'a', sessionId: 's', stepName: 's' }, 'tool.result', {
-        toolName: 'search',
-        toolCallId: 'call-1',
-        durationMs: 5,
-        error: 'timeout',
-      })
-
-      expect(stubToolSpan.setStatus).toHaveBeenCalledWith({
-        code: SpanStatusCode.ERROR,
-        message: 'timeout',
-      })
-      expect(stubToolSpan.end).toHaveBeenCalledOnce()
-    })
-  })
-
-  // ---- Group 7: "tool.result" for unknown or malformed toolCallId ----
-
-  describe('onEvent — tool.result (unknown or malformed toolCallId)', () => {
-    it('"tool.result" for an unknown toolCallId is a no-op', () => {
-      const stubRootSpan = makeStubSpan()
-      const stubStepSpan = makeStubSpan()
-      const stubTracer = makeStubTracer([stubRootSpan, stubStepSpan])
-
-      const observer = createOtelObserver(stubTracer)
-      observer.onRunStart!({ agentId: 'a', sessionId: 's', runId: 'run-1' })
-      observer.onStepStart!({ agentId: 'a', sessionId: 's', stepName: 's' })
-
-      observer.onEvent!({ agentId: 'a', sessionId: 's', stepName: 's' }, 'tool.result', {
-        toolName: 'search',
-        toolCallId: 'call-x',
-        durationMs: 10,
-      })
-
-      expect(stubRootSpan.end).not.toHaveBeenCalled()
-      expect(stubStepSpan.end).not.toHaveBeenCalled()
-    })
-
-    it('"tool.result" with non-string toolCallId is a no-op', () => {
-      const stubRootSpan = makeStubSpan()
-      const stubStepSpan = makeStubSpan()
-      const stubToolSpan = makeStubSpan()
-      const stubTracer = makeStubTracer([stubRootSpan, stubStepSpan, stubToolSpan])
-
-      const observer = createOtelObserver(stubTracer)
-      observer.onRunStart!({ agentId: 'a', sessionId: 's', runId: 'run-1' })
-      observer.onStepStart!({ agentId: 'a', sessionId: 's', stepName: 's' })
-      observer.onEvent!({ agentId: 'a', sessionId: 's', stepName: 's' }, 'tool.call', {
-        toolName: 'search',
-        toolCallId: 'call-1',
-      })
-
-      observer.onEvent!({ agentId: 'a', sessionId: 's', stepName: 's' }, 'tool.result', {
-        toolName: 'search',
-        toolCallId: 99,
-        durationMs: 5,
-      })
-
-      expect(stubToolSpan.end).not.toHaveBeenCalled()
-    })
-  })
-
-  // ---- Group 8: guard behavior for null payloads ----
-
-  describe('onEvent — tool.call and tool.result (null payloads)', () => {
-    it('"tool.call" with null payload does not throw and creates no span', () => {
-      const stubRootSpan = makeStubSpan()
-      const stubStepSpan = makeStubSpan()
-      const stubTracer = makeStubTracer([stubRootSpan, stubStepSpan])
-
-      const observer = createOtelObserver(stubTracer)
-      observer.onRunStart!({ agentId: 'a', sessionId: 's', runId: 'run-1' })
-      observer.onStepStart!({ agentId: 'a', sessionId: 's', stepName: 's' })
-
-      expect(() => {
-        observer.onEvent!({ agentId: 'a', sessionId: 's', stepName: 's' }, 'tool.call', null)
-      }).not.toThrow()
-
-      expect(stubTracer.startSpan).toHaveBeenCalledTimes(2)
-    })
-
-    it('"tool.result" with null payload does not throw', () => {
-      const stubRootSpan = makeStubSpan()
-      const stubStepSpan = makeStubSpan()
-      const stubToolSpan = makeStubSpan()
-      const stubTracer = makeStubTracer([stubRootSpan, stubStepSpan, stubToolSpan])
-
-      const observer = createOtelObserver(stubTracer)
-      observer.onRunStart!({ agentId: 'a', sessionId: 's', runId: 'run-1' })
-      observer.onStepStart!({ agentId: 'a', sessionId: 's', stepName: 's' })
-      observer.onEvent!({ agentId: 'a', sessionId: 's', stepName: 's' }, 'tool.call', {
-        toolName: 'search',
-        toolCallId: 'call-1',
-      })
-
-      expect(() => {
-        observer.onEvent!({ agentId: 'a', sessionId: 's', stepName: 's' }, 'tool.result', null)
-      }).not.toThrow()
-
-      expect(stubToolSpan.end).not.toHaveBeenCalled()
-    })
-  })
-
-  // ---- Group 9: concurrent and interleaved tool spans ----
-
-  describe('onEvent — concurrent tool spans', () => {
-    it('two concurrent tool spans with distinct toolCallIds close independently in sequence', () => {
-      const stubRootSpan = makeStubSpan()
-      const stubStepSpan = makeStubSpan()
-      const stubToolSpan1 = makeStubSpan()
-      const stubToolSpan2 = makeStubSpan()
-      const stubTracer = makeStubTracer([stubRootSpan, stubStepSpan, stubToolSpan1, stubToolSpan2])
-
-      const observer = createOtelObserver(stubTracer)
-      observer.onRunStart!({ agentId: 'a', sessionId: 's', runId: 'run-1' })
-      observer.onStepStart!({ agentId: 'a', sessionId: 's', stepName: 's' })
-
-      observer.onEvent!({ agentId: 'a', sessionId: 's', stepName: 's' }, 'tool.call', {
-        toolName: 'search',
-        toolCallId: 'call-1',
-      })
-      observer.onEvent!({ agentId: 'a', sessionId: 's', stepName: 's' }, 'tool.call', {
-        toolName: 'lookup',
-        toolCallId: 'call-2',
-      })
-
-      observer.onEvent!({ agentId: 'a', sessionId: 's', stepName: 's' }, 'tool.result', {
-        toolName: 'search',
-        toolCallId: 'call-1',
-        durationMs: 20,
-      })
-
-      expect(stubToolSpan1.end).toHaveBeenCalledOnce()
-      expect(stubToolSpan2.end).not.toHaveBeenCalled()
-
-      observer.onEvent!({ agentId: 'a', sessionId: 's', stepName: 's' }, 'tool.result', {
-        toolName: 'lookup',
-        toolCallId: 'call-2',
-        durationMs: 30,
-      })
-
-      expect(stubToolSpan2.end).toHaveBeenCalledOnce()
-    })
-
-    it('onStepEnd with open tool spans does not close those spans; subsequent "tool.result" still closes them', () => {
-      const stubRootSpan = makeStubSpan()
-      const stubStepSpan = makeStubSpan()
-      const stubToolSpan = makeStubSpan()
-      const stubTracer = makeStubTracer([stubRootSpan, stubStepSpan, stubToolSpan])
-
-      const observer = createOtelObserver(stubTracer)
-      observer.onRunStart!({ agentId: 'a', sessionId: 's', runId: 'run-1' })
-      observer.onStepStart!({ agentId: 'a', sessionId: 's', stepName: 's' })
-      observer.onEvent!({ agentId: 'a', sessionId: 's', stepName: 's' }, 'tool.call', {
-        toolName: 'search',
-        toolCallId: 'call-1',
-      })
-
-      observer.onStepEnd!({ agentId: 'a', sessionId: 's', stepName: 's' }, { durationMs: 100 })
-
-      expect(stubToolSpan.end).not.toHaveBeenCalled()
-
-      observer.onEvent!({ agentId: 'a', sessionId: 's', stepName: 's' }, 'tool.result', {
-        toolName: 'search',
-        toolCallId: 'call-1',
-        durationMs: 5,
-      })
-
-      expect(stubToolSpan.end).toHaveBeenCalledOnce()
-    })
-  })
-
-  // ---- Group 10: interaction with existing event routing ----
-
-  describe('onEvent — interaction with existing routing', () => {
-    it('"tool.call" does not call addEvent on any active span', () => {
-      const stubRootSpan = makeStubSpan()
-      const stubStepSpan = makeStubSpan()
-      const stubToolSpan = makeStubSpan()
-      const stubTracer = makeStubTracer([stubRootSpan, stubStepSpan, stubToolSpan])
-
-      const observer = createOtelObserver(stubTracer)
-      observer.onRunStart!({ agentId: 'a', sessionId: 's', runId: 'run-1' })
-      observer.onStepStart!({ agentId: 'a', sessionId: 's', stepName: 's' })
-
-      observer.onEvent!({ agentId: 'a', sessionId: 's', stepName: 's' }, 'tool.call', {
-        toolName: 'search',
-        toolCallId: 'call-1',
-      })
-
-      expect(stubStepSpan.addEvent).not.toHaveBeenCalled()
-      expect(stubRootSpan.addEvent).not.toHaveBeenCalled()
-    })
-
-    it('"tool.result" does not call addEvent on any active span', () => {
-      const stubRootSpan = makeStubSpan()
-      const stubStepSpan = makeStubSpan()
-      const stubToolSpan = makeStubSpan()
-      const stubTracer = makeStubTracer([stubRootSpan, stubStepSpan, stubToolSpan])
-
-      const observer = createOtelObserver(stubTracer)
-      observer.onRunStart!({ agentId: 'a', sessionId: 's', runId: 'run-1' })
-      observer.onStepStart!({ agentId: 'a', sessionId: 's', stepName: 's' })
-      observer.onEvent!({ agentId: 'a', sessionId: 's', stepName: 's' }, 'tool.call', {
-        toolName: 'search',
-        toolCallId: 'call-1',
-      })
-
-      observer.onEvent!({ agentId: 'a', sessionId: 's', stepName: 's' }, 'tool.result', {
-        toolName: 'search',
-        toolCallId: 'call-1',
-        durationMs: 5,
-      })
-
-      expect(stubStepSpan.addEvent).not.toHaveBeenCalled()
-      expect(stubRootSpan.addEvent).not.toHaveBeenCalled()
-    })
-
-    it('unknown event types still call activeSpan.addEvent (existing fallthrough preserved)', () => {
-      const stubRootSpan = makeStubSpan()
-      const stubStepSpan = makeStubSpan()
-      const stubTracer = makeStubTracer([stubRootSpan, stubStepSpan])
-
-      const observer = createOtelObserver(stubTracer)
-      observer.onRunStart!({ agentId: 'a', sessionId: 's', runId: 'run-1' })
-      observer.onStepStart!({ agentId: 'a', sessionId: 's', stepName: 's' })
-
-      observer.onEvent!({ agentId: 'a', sessionId: 's', stepName: 's' }, 'custom.event', { x: 1 })
-
-      expect(stubStepSpan.addEvent).toHaveBeenCalledWith('custom.event')
-      expect(stubRootSpan.addEvent).not.toHaveBeenCalled()
-    })
-
-    it('"llm.response" token metrics still recorded correctly after tool span changes', () => {
-      const { meterProvider, counter } = makeStubMeterProvider()
-      const stubRootSpan = makeStubSpan()
-      const stubStepSpan = makeStubSpan()
-      const stubTracer = makeStubTracer([stubRootSpan, stubStepSpan])
-
-      const observer = createOtelObserver(stubTracer, { meterProvider })
-      observer.onRunStart!({ agentId: 'a', sessionId: 's', runId: 'run-1' })
-      observer.onStepStart!({ agentId: 'a', sessionId: 's', stepName: 'llm' })
-
-      observer.onEvent!({ agentId: 'a', sessionId: 's', stepName: 'llm' }, 'llm.response', {
-        tokens: { input: 200, output: 100 },
-      })
-
-      expect(counter.add).toHaveBeenCalledTimes(2)
-      expect(counter.add).toHaveBeenCalledWith(200, { 'token.type': 'input' })
-      expect(counter.add).toHaveBeenCalledWith(100, { 'token.type': 'output' })
-    })
-  })
-
-  // ---- Group 11: closure isolation between observer instances ----
-
-  describe('onEvent — closure isolation (toolSpans)', () => {
-    it('two observer instances maintain independent toolSpans maps', () => {
-      const stubRootSpan1 = makeStubSpan()
-      const stubStepSpan1 = makeStubSpan()
-      const stubToolSpanA = makeStubSpan()
-      const stubRootSpan2 = makeStubSpan()
-      const stubStepSpan2 = makeStubSpan()
-      const stubToolSpanB = makeStubSpan()
-      const stubTracer1 = makeStubTracer([stubRootSpan1, stubStepSpan1, stubToolSpanA])
-      const stubTracer2 = makeStubTracer([stubRootSpan2, stubStepSpan2, stubToolSpanB])
-
-      const observerA = createOtelObserver(stubTracer1)
-      const observerB = createOtelObserver(stubTracer2)
-
-      observerA.onRunStart!({ agentId: 'a', sessionId: 's1', runId: 'run-1' })
-      observerA.onStepStart!({ agentId: 'a', sessionId: 's1', stepName: 's1' })
-      observerB.onRunStart!({ agentId: 'b', sessionId: 's2', runId: 'run-2' })
-      observerB.onStepStart!({ agentId: 'b', sessionId: 's2', stepName: 's2' })
-
-      observerA.onEvent!({ agentId: 'a', sessionId: 's1', stepName: 's1' }, 'tool.call', {
-        toolName: 'x',
-        toolCallId: 'call-1',
-      })
-      observerB.onEvent!({ agentId: 'b', sessionId: 's2', stepName: 's2' }, 'tool.call', {
-        toolName: 'y',
-        toolCallId: 'call-1',
-      })
-
-      observerA.onEvent!({ agentId: 'a', sessionId: 's1', stepName: 's1' }, 'tool.result', {
-        toolName: 'x',
-        toolCallId: 'call-1',
-        durationMs: 5,
-      })
-
-      expect(stubToolSpanA.end).toHaveBeenCalledOnce()
-      expect(stubToolSpanB.end).not.toHaveBeenCalled()
-    })
-  })
-
-  // ---- Group 12: onRunEnd cleanup ----
-
-  describe('onEvent — onRunEnd with open tool spans', () => {
-    it('onRunEnd ends root span normally when tool spans remain open; does not throw', () => {
-      const stubRootSpan = makeStubSpan()
-      const stubStepSpan = makeStubSpan()
-      const stubToolSpan = makeStubSpan()
-      const stubTracer = makeStubTracer([stubRootSpan, stubStepSpan, stubToolSpan])
-
-      const observer = createOtelObserver(stubTracer)
-      observer.onRunStart!({ agentId: 'a', sessionId: 's', runId: 'run-1' })
-      observer.onStepStart!({ agentId: 'a', sessionId: 's', stepName: 's' })
-      observer.onEvent!({ agentId: 'a', sessionId: 's', stepName: 's' }, 'tool.call', {
-        toolName: 'search',
-        toolCallId: 'call-1',
-      })
-      observer.onStepEnd!({ agentId: 'a', sessionId: 's', stepName: 's' }, { durationMs: 100 })
-
-      observer.onRunEnd!({ agentId: 'a', sessionId: 's', runId: 'run-1' }, { signal: 'done', durationMs: 500 })
-
-      expect(stubRootSpan.end).toHaveBeenCalledOnce()
-      expect(stubToolSpan.end).not.toHaveBeenCalled()
+  // ---- Group 11: Inference span synchronous end (Invariant 6) ----
+
+  describe('inference span synchronous end', () => {
+    it('inference span end() is called synchronously within the same onEvent call', () => {
+      // arrange
+      const mockRootSpan = makeStubSpan()
+      const callOrder: string[] = []
+      const mockInferenceSpan = {
+        ...makeStubSpan(),
+        end: vi.fn().mockImplementation(() => { callOrder.push('inferenceSpan.end') }),
+      } as unknown as Span // as: partial stub with call-order tracking
+      const mockTracer = makeStubTracer([mockRootSpan, mockInferenceSpan])
+      const observer = createOtelObserver(mockTracer)
+      observer.onRunStart!({ agentId: 'a', sessionId: 's', runId: 'r' })
+      const payload = { modelId: 'gpt-4o', providerName: 'openai', tokens: { input: 4, output: 2 } }
+
+      // act
+      callOrder.push('onEvent:start')
+      observer.onEvent!({ agentId: 'a', sessionId: 's', stepName: 's' }, 'llm.response', payload)
+      callOrder.push('onEvent:end')
+
+      // assert
+      expect(callOrder).toEqual(['onEvent:start', 'inferenceSpan.end', 'onEvent:end'])
+      expect(mockInferenceSpan.end).toHaveBeenCalledOnce()
     })
   })
 })

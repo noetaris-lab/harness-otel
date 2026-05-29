@@ -1,4 +1,4 @@
-import type { Tracer, MeterProvider, Context, Attributes, Span, Counter, Histogram } from '@opentelemetry/api'
+import type { Tracer, MeterProvider, Context, Attributes, Span, Histogram } from '@opentelemetry/api'
 import { SpanStatusCode, SpanKind, context, trace } from '@opentelemetry/api'
 import type { Observer, RunContext, StepContext } from '@noetaris/harness'
 
@@ -10,107 +10,123 @@ export interface OtelObserverOptions {
   meterProvider?: MeterProvider
   /**
    * Explicit parent context for the root span. When provided, the root
-   * `agent.run` span is created as a child of the span in this context.
+   * "invoke_agent {agentId}" span is created as a child of the span in this context.
    * When absent, `context.active()` is used (ambient context from OTel middleware).
    */
   parentContext?: Context
   /**
-   * Extra attributes merged onto the root `agent.run` span at start time.
-   * These are merged with the built-in attributes (`agent.id`, `session.id`);
-   * if a key conflicts, the built-in attribute takes precedence.
+   * Extra attributes merged onto the root span at start time.
+   * These are merged with the built-in attributes; built-in attributes take precedence.
    */
   attributes?: Attributes
 }
 
 // Local shape guards — avoid importing @noetaris/harness-types
-type LLMUsageShape = { tokens?: { input?: unknown; output?: unknown } | null }
+type LLMUsageShape = {
+  modelId?: unknown
+  providerName?: unknown
+  stopReason?: unknown
+  tokens?: { input?: unknown; output?: unknown } | null
+}
 type ToolCallShape = { toolName?: unknown; toolCallId?: unknown }
 type ToolResultShape = { toolName?: unknown; toolCallId?: unknown; durationMs?: unknown; error?: unknown }
 
 /**
- * Create an {@link Observer} that records traces and metrics via OpenTelemetry.
+ * Create an {@link Observer} that records traces and metrics via OpenTelemetry
+ * following the GenAI semantic conventions.
  *
  * **Spans produced:**
- * - `agent.run` — root span, one per `agent.run()` invocation.
- * - `agent.step` — child span, one per step execution.
+ * - `invoke_agent {agentId}` — root span, one per `agent.run()` invocation.
+ * - `harness.step {stepName}` — child span, one per step execution.
+ * - `chat {modelId}` — INTERNAL child span, one per `"llm.response"` event.
+ * - `execute_tool {toolName}` — INTERNAL child span, one per `"tool.call"` event.
  *
  * **Metrics produced** (requires `options.meterProvider`):
- * - `agent.llm.tokens` (counter) — input/output tokens, tagged by `token.type`.
- * - `agent.step.duration` (histogram, ms) — step duration, tagged by `step.name`.
+ * - `gen_ai.client.token.usage` (histogram, `{token}`) — input/output tokens per inference call.
+ * - `gen_ai.client.operation.duration` (histogram, `s`) — agent invocation duration.
  *
  * @param tracer - An OTel `Tracer` instance from your SDK.
  * @param options - Optional meter provider, parent context, and extra span attributes.
- *
- * @example
- * ```ts
- * const observer = createOtelObserver(trace.getTracer('my-agent'), {
- *   meterProvider: metrics.getMeterProvider(),
- * })
- * agent.run({}, { llm, observer })
- * ```
  */
 export function createOtelObserver(tracer: Tracer, options?: OtelObserverOptions): Observer {
   let rootSpan: Span | undefined
   let stepSpan: Span | undefined
   const toolSpans = new Map<string, Span>()
 
-  let counter: Counter | undefined
-  let histogram: Histogram | undefined
+  let tokenHistogram: Histogram | undefined
+  let durationHistogram: Histogram | undefined
 
   if (options?.meterProvider) {
     const meter = options.meterProvider.getMeter('@noetaris/harness-otel', '0.1.0')
-    counter = meter.createCounter('agent.llm.tokens')
-    histogram = meter.createHistogram('agent.step.duration', { unit: 'ms' })
+    tokenHistogram = meter.createHistogram('gen_ai.client.token.usage', { unit: '{token}' })
+    durationHistogram = meter.createHistogram('gen_ai.client.operation.duration', { unit: 's' })
   }
 
   return {
     onRunStart(ctx: RunContext): void {
       const builtIn: Attributes = {
-        'agent.id': ctx.agentId,
-        'session.id': ctx.sessionId,
+        'gen_ai.agent.id': ctx.agentId,
+        'gen_ai.conversation.id': ctx.sessionId,
+        'gen_ai.operation.name': 'invoke_agent',
       }
       const merged: Attributes = { ...options?.attributes, ...builtIn }
       const parentCtx = options?.parentContext ?? context.active()
-      rootSpan = tracer.startSpan('agent.run', { attributes: merged }, parentCtx)
+      rootSpan = tracer.startSpan(`invoke_agent ${ctx.agentId}`, { attributes: merged }, parentCtx)
     },
 
-    onRunEnd(_ctx: RunContext, _event: { signal: string; durationMs: number }): void {
+    onRunEnd(_ctx: RunContext, event: { signal: string; durationMs: number }): void {
       if (!rootSpan) return
       rootSpan.end()
       rootSpan = undefined
+      durationHistogram?.record(event.durationMs / 1000, { 'gen_ai.operation.name': 'invoke_agent' })
     },
 
     onStepStart(ctx: StepContext): void {
       if (!rootSpan) return
       const childCtx = trace.setSpan(context.active(), rootSpan)
-      stepSpan = tracer.startSpan('agent.step', { attributes: { 'step.name': ctx.stepName } }, childCtx)
+      stepSpan = tracer.startSpan(`harness.step ${ctx.stepName}`, { attributes: { 'gen_ai.step.name': ctx.stepName } }, childCtx)
     },
 
-    onStepEnd(ctx: StepContext, event: { durationMs: number }): void {
+    onStepEnd(_ctx: StepContext, _event: { durationMs: number }): void {
       if (!stepSpan) return
       const span = stepSpan
       stepSpan = undefined
-      histogram?.record(event.durationMs, { 'step.name': ctx.stepName })
       span.end()
     },
 
-    onStepError(ctx: StepContext, event: { error: unknown; durationMs: number }): void {
+    onStepError(_ctx: StepContext, event: { error: unknown; durationMs: number }): void {
       if (!stepSpan) return
       const span = stepSpan
       stepSpan = undefined
       span.setStatus({ code: SpanStatusCode.ERROR, message: String(event.error) })
-      histogram?.record(event.durationMs, { 'step.name': ctx.stepName })
       span.end()
     },
 
     onEvent(_ctx: StepContext, type: string, payload: unknown): void {
       if (type === 'llm.response') {
-        if (counter) {
-          const shaped = payload as LLMUsageShape // as: payload is unknown; guard below validates the shape before use
+        const shaped = payload as LLMUsageShape // as: payload is unknown; guards below validate the shape before use
+
+        // inference span — requires string modelId and providerName
+        const parentSpan = stepSpan ?? rootSpan
+        if (parentSpan && typeof shaped?.modelId === 'string' && typeof shaped?.providerName === 'string') {
+          const childCtx = trace.setSpan(context.active(), parentSpan)
+          const inferenceSpan = tracer.startSpan(`chat ${shaped.modelId}`, { kind: SpanKind.INTERNAL }, childCtx)
+          inferenceSpan.setAttribute('gen_ai.request.model', shaped.modelId)
+          inferenceSpan.setAttribute('gen_ai.provider.name', shaped.providerName)
           if (typeof shaped?.tokens?.input === 'number' && typeof shaped?.tokens?.output === 'number') {
-            counter.add(shaped.tokens.input, { 'token.type': 'input' })
-            counter.add(shaped.tokens.output, { 'token.type': 'output' })
+            inferenceSpan.setAttribute('gen_ai.usage.input_tokens', shaped.tokens.input)
+            inferenceSpan.setAttribute('gen_ai.usage.output_tokens', shaped.tokens.output)
           }
+          if (typeof shaped?.stopReason === 'string') {
+            inferenceSpan.setAttribute('gen_ai.response.finish_reasons', [shaped.stopReason])
+          }
+          inferenceSpan.end()
+        }
+
+        // token histogram — independent of span creation
+        if (tokenHistogram && typeof shaped?.tokens?.input === 'number' && typeof shaped?.tokens?.output === 'number') {
+          tokenHistogram.record(shaped.tokens.input, { 'gen_ai.token.type': 'input' })
+          tokenHistogram.record(shaped.tokens.output, { 'gen_ai.token.type': 'output' })
         }
         return
       }
