@@ -1,5 +1,5 @@
 import type { Tracer, MeterProvider, Context, Attributes, Span, Counter, Histogram } from '@opentelemetry/api'
-import { SpanStatusCode, context, trace } from '@opentelemetry/api'
+import { SpanStatusCode, SpanKind, context, trace } from '@opentelemetry/api'
 import type { Observer, RunContext, StepContext } from '@noetaris/harness'
 
 /**
@@ -22,8 +22,10 @@ export interface OtelObserverOptions {
   attributes?: Attributes
 }
 
-// Local shape guard — avoids importing @noetaris/harness-types
+// Local shape guards — avoid importing @noetaris/harness-types
 type LLMUsageShape = { tokens?: { input?: unknown; output?: unknown } | null }
+type ToolCallShape = { toolName?: unknown; toolCallId?: unknown }
+type ToolResultShape = { toolName?: unknown; toolCallId?: unknown; durationMs?: unknown; error?: unknown }
 
 /**
  * Create an {@link Observer} that records traces and metrics via OpenTelemetry.
@@ -50,6 +52,7 @@ type LLMUsageShape = { tokens?: { input?: unknown; output?: unknown } | null }
 export function createOtelObserver(tracer: Tracer, options?: OtelObserverOptions): Observer {
   let rootSpan: Span | undefined
   let stepSpan: Span | undefined
+  const toolSpans = new Map<string, Span>()
 
   let counter: Counter | undefined
   let histogram: Histogram | undefined
@@ -109,6 +112,41 @@ export function createOtelObserver(tracer: Tracer, options?: OtelObserverOptions
             counter.add(shaped.tokens.output, { 'token.type': 'output' })
           }
         }
+        return
+      }
+
+      if (type === 'tool.call') {
+        const shaped = payload as ToolCallShape // as: payload is unknown; guard below validates the shape before use
+        if (typeof shaped?.toolName !== 'string' || typeof shaped?.toolCallId !== 'string') return
+
+        const parentSpan = stepSpan ?? rootSpan
+        if (!parentSpan) return
+
+        const childCtx = trace.setSpan(context.active(), parentSpan)
+        const toolSpan = tracer.startSpan('execute_tool ' + shaped.toolName, {
+          kind: SpanKind.INTERNAL,
+          attributes: {
+            'gen_ai.tool.name': shaped.toolName,
+            'gen_ai.operation.name': 'execute_tool',
+          },
+        }, childCtx)
+        toolSpans.set(shaped.toolCallId, toolSpan)
+        return
+      }
+
+      if (type === 'tool.result') {
+        const shaped = payload as ToolResultShape // as: payload is unknown; guard below validates the shape before use
+        if (typeof shaped?.toolCallId !== 'string') return
+
+        const toolSpan = toolSpans.get(shaped.toolCallId)
+        if (!toolSpan) return
+
+        toolSpans.delete(shaped.toolCallId)
+
+        if (shaped.error !== undefined) {
+          toolSpan.setStatus({ code: SpanStatusCode.ERROR, message: String(shaped.error) })
+        }
+        toolSpan.end()
         return
       }
 
